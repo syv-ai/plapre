@@ -182,6 +182,14 @@ class Plapre:
         log.info("Saved %.2fs audio to %s", len(audio) / SAMPLE_RATE, output)
         return audio
 
+    def extract_speaker(self, wav_path: str) -> torch.Tensor:
+        """Extract a 128-dim speaker embedding from a wav file.
+
+        The returned tensor can be passed to ``speak(speaker_emb=...)``
+        for consistent voice across multiple generations.
+        """
+        return self._extract_speaker_emb(wav_path)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

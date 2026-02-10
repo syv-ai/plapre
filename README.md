@@ -80,14 +80,14 @@ tts.speak(
 )
 ```
 
-### Using a speaker embedding directly
+### Extract a speaker embedding
+
+Extract a 128-dim speaker embedding from a wav file, then reuse it across multiple generations:
 
 ```python
-import torch
-
-# 128-dim speaker embedding from Kanade encoder
-speaker_emb = torch.randn(128)
-tts.speak("Hej.", output="output.wav", speaker_emb=speaker_emb)
+speaker_emb = tts.extract_speaker("reference.wav")
+tts.speak("Hej.", output="a.wav", speaker_emb=speaker_emb)
+tts.speak("Farvel.", output="b.wav", speaker_emb=speaker_emb)
 ```
 
 ### Return value
