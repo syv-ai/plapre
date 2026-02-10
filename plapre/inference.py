@@ -378,7 +378,12 @@ class Plapre:
     def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
         import torchaudio
 
-        wav, sr = torchaudio.load(wav_path)
+        data, sr = sf.read(wav_path, dtype="float32")
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+        else:
+            data = data.T  # (channels, samples)
+        wav = torch.from_numpy(data)
         if sr != SAMPLE_RATE:
             wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
         if wav.shape[0] > 1:
