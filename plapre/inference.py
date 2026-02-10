@@ -190,6 +190,35 @@ class Plapre:
         """
         return self._extract_speaker_emb(wav_path)
 
+    def replace_speaker(
+        self,
+        audio_path: str,
+        output: str = "output.wav",
+        speaker: str | None = None,
+        speaker_wav: str | None = None,
+        speaker_emb: torch.Tensor | None = None,
+    ) -> np.ndarray:
+        """Replace the speaker in an audio file while keeping the content.
+
+        Encodes *audio_path* with Kanade to extract content tokens, then
+        decodes with the target speaker embedding to produce new audio.
+        """
+        target_emb = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
+        wav = self._read_wav(audio_path)
+
+        with torch.no_grad():
+            features = self.kanade.encode(wav.to(self.device))
+            mel = self.kanade.decode(
+                content_token_indices=features.content_token_indices,
+                global_embedding=target_emb.float(),
+            )
+            waveform = vocode(self.vocoder, mel.unsqueeze(0))
+
+        audio = waveform.squeeze().cpu().numpy()
+        sf.write(output, audio, SAMPLE_RATE)
+        log.info("Saved %.2fs audio to %s", len(audio) / SAMPLE_RATE, output)
+        return audio
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -537,7 +566,8 @@ class Plapre:
             return None
         return np.concatenate(chunks)
 
-    def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
+    @staticmethod
+    def _read_wav(wav_path: str) -> torch.Tensor:
         import torchaudio
 
         data, sr = sf.read(wav_path, dtype="float32")
@@ -550,6 +580,10 @@ class Plapre:
             wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
+        return wav
+
+    def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
+        wav = self._read_wav(wav_path)
         with torch.no_grad():
             features = self.kanade.encode(wav.to(self.device))
         return features.global_embedding

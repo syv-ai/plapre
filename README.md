@@ -90,6 +90,17 @@ tts.speak("Hej.", output="a.wav", speaker_emb=speaker_emb)
 tts.speak("Farvel.", output="b.wav", speaker_emb=speaker_emb)
 ```
 
+### Replace speaker (voice conversion)
+
+Replace the speaker in an existing audio file while keeping the content:
+
+```python
+tts.replace_speaker("source.wav", output="converted.wav", speaker="nic")
+
+# Or use a reference wav as the target voice
+tts.replace_speaker("source.wav", output="converted.wav", speaker_wav="target_voice.wav")
+```
+
 ### Return value
 
 `speak()` returns the audio as a numpy array (24 kHz, float32), in addition to saving the file:
