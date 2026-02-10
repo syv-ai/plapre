@@ -1,6 +1,6 @@
 # Plapre
 
-Danish text-to-speech synthesis.
+Danish text-to-speech synthesis. Uses llama.cpp for fast inference.
 
 ## Installation
 
@@ -26,6 +26,20 @@ from plapre import Plapre
 
 tts = Plapre("syvai/plapre-turbo")
 tts.speak("Hej, hvordan har du det?", output="output.wav")
+```
+
+### Quantization
+
+GGUF models are downloaded automatically. Available quants: `f16`, `q8_0` (default), `q6_k`, `q4_k_m`, `q4_0`.
+
+```python
+tts = Plapre("syvai/plapre-turbo", quant="q4_k_m")
+```
+
+Or use a local GGUF file:
+
+```python
+tts = Plapre("syvai/plapre-turbo", model_path="/path/to/model.gguf")
 ```
 
 ### Choose a speaker

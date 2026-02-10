@@ -13,6 +13,7 @@ dependencies = [
     "torch",
     "torchaudio",
     "transformers",
+    "llama-cpp-python",
     "soundfile",
     "phonemizer",
     "numpy",
