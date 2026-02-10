@@ -14,7 +14,7 @@ brew install espeak-ng
 sudo apt install espeak-ng
 
 # Install plapre
-pip install git+https://github.com/syv-ai/plapre.git
+uv add git+https://github.com/syv-ai/plapre.git
 ```
 
 ## Usage
