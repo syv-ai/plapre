@@ -120,6 +120,7 @@ class Plapre:
         cparams.flash_attn = flash_attn
         cparams.type_k = 0  # f16
         cparams.type_v = 0
+        cparams.n_seq_max = 16
 
         self._ctx = llama_cpp.llama_init_from_model(self._model, cparams)
         if not self._ctx:
@@ -166,19 +167,11 @@ class Plapre:
 
         if split_sentences:
             sentences = self._split_sentences(text)
-            chunks = []
-            silence = np.zeros(int(silence_duration * SAMPLE_RATE), dtype=np.float32)
-            for i, sent in enumerate(sentences):
-                log.info("Sentence %d/%d: %s", i + 1, len(sentences), sent)
-                audio = self._generate_audio(sent, spk, **gen_kwargs)
-                if audio is not None:
-                    chunks.append(audio)
-                    if i < len(sentences) - 1:
-                        chunks.append(silence)
-            if not chunks:
+            log.info("Batched generation for %d sentences", len(sentences))
+            audio = self._generate_audio_batch(sentences, spk, silence_duration, **gen_kwargs)
+            if audio is None:
                 log.error("No audio generated for any sentence.")
                 return np.array([], dtype=np.float32)
-            audio = np.concatenate(chunks)
         else:
             audio = self._generate_audio(text, spk, **gen_kwargs)
             if audio is None:
@@ -262,6 +255,18 @@ class Plapre:
             + [ph_start] + phone_ids + [ph_end, audio_start]
         )
 
+    def _create_sampler(self, temperature: float, top_p: float, top_k: int):
+        sparams = llama_sampler_chain_default_params()
+        smpl = llama_sampler_chain_init(sparams)
+        if top_k > 0:
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k))
+        if top_p < 1.0:
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1))
+        if temperature > 0:
+            llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature))
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(42))
+        return smpl
+
     def _generate_tokens(
         self,
         prompt_tokens: list[int],
@@ -271,7 +276,7 @@ class Plapre:
         top_k: int,
         max_tokens: int,
     ) -> list[int]:
-        """Generate audio token IDs using llama.cpp."""
+        """Generate audio token IDs using llama.cpp (single sequence)."""
         llama_kv_self_clear(self._ctx)
 
         n_prompt = len(prompt_tokens)
@@ -304,16 +309,7 @@ class Plapre:
             llama_batch_free(batch)
             raise RuntimeError(f"Prompt decode failed: {rc}")
 
-        # Sampler
-        sparams = llama_sampler_chain_default_params()
-        smpl = llama_sampler_chain_init(sparams)
-        if top_k > 0:
-            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k))
-        if top_p < 1.0:
-            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1))
-        if temperature > 0:
-            llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature))
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(42))
+        smpl = self._create_sampler(temperature, top_p, top_k)
 
         generated = []
         pos = 1 + n_prompt
@@ -336,6 +332,119 @@ class Plapre:
             pos += 1
 
         llama_sampler_free(smpl)
+        llama_batch_free(batch)
+        return generated
+
+    def _generate_tokens_batch(
+        self,
+        prompt_tokens_list: list[list[int]],
+        speaker_hidden: np.ndarray,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_tokens: int,
+    ) -> list[list[int]]:
+        """Generate audio tokens for multiple prompts in parallel."""
+        batch_size = len(prompt_tokens_list)
+        if batch_size == 1:
+            return [self._generate_tokens(
+                prompt_tokens_list[0], speaker_hidden, temperature, top_p, top_k, max_tokens,
+            )]
+
+        llama_kv_self_clear(self._ctx)
+        total_prompt_tokens = sum(len(p) for p in prompt_tokens_list)
+
+        # Decode speaker embeddings for all sequences at position 0
+        embd_batch = llama_batch_init(batch_size, HIDDEN_SIZE, 1)
+        embd_batch.n_tokens = batch_size
+        for seq_id in range(batch_size):
+            dst_ptr = ctypes.addressof(embd_batch.embd.contents) + seq_id * HIDDEN_SIZE * 4
+            ctypes.memmove(dst_ptr, speaker_hidden.ctypes.data, HIDDEN_SIZE * 4)
+            embd_batch.pos[seq_id] = 0
+            embd_batch.n_seq_id[seq_id] = 1
+            embd_batch.seq_id[seq_id][0] = seq_id
+            embd_batch.logits[seq_id] = 0
+
+        rc = llama_decode(self._ctx, embd_batch)
+        llama_batch_free(embd_batch)
+        if rc != 0:
+            raise RuntimeError(f"Batch speaker embedding decode failed: {rc}")
+
+        # Decode all prompt tokens at positions 1..N per sequence
+        batch = llama_batch_init(max(total_prompt_tokens + 64, batch_size * 2), 0, 1)
+        idx = 0
+        for seq_id, prompt in enumerate(prompt_tokens_list):
+            for pos, tid in enumerate(prompt):
+                batch.token[idx] = tid
+                batch.pos[idx] = pos + 1
+                batch.n_seq_id[idx] = 1
+                batch.seq_id[idx][0] = seq_id
+                batch.logits[idx] = 1 if pos == len(prompt) - 1 else 0
+                idx += 1
+        batch.n_tokens = idx
+
+        rc = llama_decode(self._ctx, batch)
+        if rc != 0:
+            llama_batch_free(batch)
+            raise RuntimeError(f"Batch prompt decode failed: {rc}")
+
+        # Per-sequence samplers
+        samplers = [self._create_sampler(temperature, top_p, top_k) for _ in range(batch_size)]
+
+        generated = [[] for _ in range(batch_size)]
+        finished = [False] * batch_size
+        positions = [1 + len(p) for p in prompt_tokens_list]
+
+        # Sample first token for each sequence
+        logits_indices = []
+        offset = 0
+        for seq_id, prompt in enumerate(prompt_tokens_list):
+            logits_indices.append(offset + len(prompt) - 1)
+            offset += len(prompt)
+
+        for seq_id in range(batch_size):
+            new_token = llama_sampler_sample(samplers[seq_id], self._ctx, logits_indices[seq_id])
+            if new_token == self.audio_end_id or new_token == self.eos_id:
+                finished[seq_id] = True
+            else:
+                generated[seq_id].append(new_token)
+
+        # Autoregressive loop
+        for _ in range(max_tokens - 1):
+            if all(finished):
+                break
+
+            idx = 0
+            active = []
+            for seq_id in range(batch_size):
+                if finished[seq_id]:
+                    continue
+                batch.token[idx] = generated[seq_id][-1]
+                batch.pos[idx] = positions[seq_id]
+                batch.n_seq_id[idx] = 1
+                batch.seq_id[idx][0] = seq_id
+                batch.logits[idx] = 1
+                active.append((seq_id, idx))
+                idx += 1
+                positions[seq_id] += 1
+
+            if idx == 0:
+                break
+            batch.n_tokens = idx
+
+            rc = llama_decode(self._ctx, batch)
+            if rc != 0:
+                break
+
+            for seq_id, batch_idx in active:
+                new_token = llama_sampler_sample(samplers[seq_id], self._ctx, batch_idx)
+                if new_token == self.audio_end_id or new_token == self.eos_id:
+                    finished[seq_id] = True
+                else:
+                    generated[seq_id].append(new_token)
+
+        for smpl in samplers:
+            llama_sampler_free(smpl)
         llama_batch_free(batch)
         return generated
 
@@ -374,6 +483,51 @@ class Plapre:
             waveform = vocode(self.vocoder, mel.unsqueeze(0))
 
         return waveform.squeeze().cpu().numpy()
+
+    def _generate_audio_batch(
+        self,
+        sentences: list[str],
+        speaker_emb: torch.Tensor,
+        silence_duration: float,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_tokens: int,
+    ) -> np.ndarray | None:
+        prompt_list = []
+        for sent in sentences:
+            phonemes = self._phonemize(sent)
+            prompt_list.append(self._build_prompt(sent, phonemes))
+
+        speaker_hidden = self._project_speaker(speaker_emb)
+        all_generated = self._generate_tokens_batch(
+            prompt_list, speaker_hidden, temperature, top_p, top_k, max_tokens,
+        )
+
+        silence = np.zeros(int(silence_duration * SAMPLE_RATE), dtype=np.float32)
+        chunks = []
+        for i, generated in enumerate(all_generated):
+            kanade_indices = [
+                tid - self.audio_token_start
+                for tid in generated
+                if self.audio_token_start <= tid <= self.audio_token_end
+            ]
+            if not kanade_indices:
+                continue
+            tokens_tensor = torch.tensor(kanade_indices, dtype=torch.long, device=self.device)
+            with torch.no_grad():
+                mel = self.kanade.decode(
+                    content_token_indices=tokens_tensor,
+                    global_embedding=speaker_emb.float().to(self.device),
+                )
+                waveform = vocode(self.vocoder, mel.unsqueeze(0))
+            chunks.append(waveform.squeeze().cpu().numpy())
+            if i < len(all_generated) - 1:
+                chunks.append(silence)
+
+        if not chunks:
+            return None
+        return np.concatenate(chunks)
 
     def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
         import torchaudio
