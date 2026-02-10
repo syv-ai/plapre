@@ -28,6 +28,15 @@ tts = Plapre("syvai/plapre-turbo")
 tts.speak("Hej, hvordan har du det?", output="output.wav")
 ```
 
+### Choose a speaker
+
+Built-in speakers are loaded from the model repo. The first speaker is used by default.
+
+```python
+# Use a specific speaker
+tts.speak("Hej med dig.", output="output.wav", speaker="nic")
+```
+
 ### Voice cloning
 
 ```python

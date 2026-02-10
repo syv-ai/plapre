@@ -19,3 +19,6 @@ dependencies = [
     "huggingface-hub",
     "kanade-tokenizer @ git+https://github.com/frothywater/kanade-tokenizer",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["plapre"]

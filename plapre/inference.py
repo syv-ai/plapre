@@ -14,6 +14,7 @@ Usage:
     tts.speak("Sætning et. Sætning to.", output="long.wav", split_sentences=True)
 """
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -49,6 +50,9 @@ class Plapre:
         ).to(self.device).eval()
 
         self.speaker_proj = self._load_speaker_proj(checkpoint)
+        self.speakers = self._load_speakers()
+        self.default_speaker = next(iter(self.speakers))
+        log.info("Loaded %d speaker(s): %s (default: %s)", len(self.speakers), list(self.speakers.keys()), self.default_speaker)
 
         self.audio_token_start = self.tokenizer.convert_tokens_to_ids("<audio_0>")
         self.audio_token_end = self.tokenizer.convert_tokens_to_ids("<audio_12799>")
@@ -73,6 +77,7 @@ class Plapre:
         self,
         text: str,
         output: str = "output.wav",
+        speaker: str | None = None,
         speaker_wav: str | None = None,
         speaker_emb: torch.Tensor | None = None,
         temperature: float = 0.8,
@@ -83,7 +88,7 @@ class Plapre:
         silence_duration: float = 0.3,
     ) -> np.ndarray:
         """Synthesize speech and save to *output*. Returns the audio as a numpy array."""
-        spk = self._resolve_speaker(speaker_wav, speaker_emb)
+        spk = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
 
         gen_kwargs = dict(temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=max_tokens)
 
@@ -115,6 +120,15 @@ class Plapre:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _load_speakers(self) -> dict[str, torch.Tensor]:
+        path = Path(__file__).parent / "speakers.json"
+        with open(path) as f:
+            raw = json.load(f)
+        return {
+            name: torch.tensor(emb, dtype=torch.float32, device=self.device)
+            for name, emb in raw.items()
+        }
 
     def _load_speaker_proj(self, checkpoint: str) -> nn.Linear:
         hidden_size = self.model.config.hidden_size
@@ -225,7 +239,7 @@ class Plapre:
         return features.global_embedding
 
     def _resolve_speaker(
-        self, speaker_wav: str | None, speaker_emb: torch.Tensor | None
+        self, speaker: str | None, speaker_wav: str | None, speaker_emb: torch.Tensor | None
     ) -> torch.Tensor:
         if speaker_emb is not None:
             return speaker_emb.to(self.device)
@@ -233,7 +247,10 @@ class Plapre:
             emb = self._extract_speaker_emb(speaker_wav)
             log.info("Speaker embedding from %s, norm=%.3f", speaker_wav, emb.norm())
             return emb
-        return torch.zeros(SPEAKER_DIM, dtype=torch.float32, device=self.device)
+        name = speaker or self.default_speaker
+        if name not in self.speakers:
+            raise ValueError(f"Unknown speaker '{name}'. Available: {list(self.speakers.keys())}")
+        return self.speakers[name]
 
     @staticmethod
     def _split_sentences(text: str) -> list[str]:
