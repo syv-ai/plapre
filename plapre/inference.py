@@ -112,8 +112,8 @@ class Plapre:
             raise RuntimeError(f"Failed to load GGUF model: {gguf_path}")
 
         cparams = llama_cpp.llama_context_default_params()
-        cparams.n_ctx = 2048
-        cparams.n_batch = 512
+        cparams.n_ctx = 8192
+        cparams.n_batch = 2048
         cparams.n_ubatch = 512
         cparams.n_threads = 1
         cparams.n_threads_batch = 1
