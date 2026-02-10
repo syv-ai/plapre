@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "plapre"
+version = "0.1.0"
+description = "Danish text-to-speech synthesis"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "torch",
+    "torchaudio",
+    "transformers",
+    "soundfile",
+    "phonemizer",
+    "numpy",
+    "huggingface-hub",
+    "kanade-tokenizer @ git+https://github.com/frothywater/kanade-tokenizer",
+]
