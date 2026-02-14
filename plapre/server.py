@@ -12,10 +12,11 @@ import asyncio
 import logging
 import os
 import struct
+import tempfile
 from contextlib import asynccontextmanager
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -158,6 +159,27 @@ async def speakers():
     if _tts is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     return {"speakers": list(_tts.speakers.keys())}
+
+
+@app.post("/v1/speakers")
+async def add_speaker(name: str = Form(...), file: UploadFile = File(...)):
+    if _tts is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    if not file.filename or not file.filename.lower().endswith(".wav"):
+        raise HTTPException(status_code=400, detail="File must be a .wav file")
+
+    if name in _tts.speakers:
+        raise HTTPException(status_code=409, detail=f"Speaker '{name}' already exists")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+        tmp.write(await file.read())
+        tmp.flush()
+        emb = await asyncio.to_thread(_tts._extract_speaker_emb, tmp.name)
+
+    _tts.speakers[name] = emb
+    log.info("Added speaker '%s', norm=%.3f", name, emb.norm())
+    return {"speaker": name, "speakers": list(_tts.speakers.keys())}
 
 
 @app.get("/v1/models")
