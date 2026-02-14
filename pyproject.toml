@@ -20,6 +20,12 @@ dependencies = [
     "kanade-tokenizer @ git+https://github.com/frothywater/kanade-tokenizer",
 ]
 
+[project.optional-dependencies]
+serve = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+
+[project.scripts]
+plapre-serve = "plapre.server:main"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 

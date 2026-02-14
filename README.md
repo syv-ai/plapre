@@ -96,3 +96,48 @@ tts.speak("Farvel.", output="b.wav", speaker_emb=speaker_emb)
 audio = tts.speak("Hej.", output="output.wav")
 print(f"Duration: {len(audio) / 24000:.2f}s")
 ```
+
+## API Server
+
+Plapre includes a FastAPI server that streams raw PCM audio with chunked transfer encoding, so clients can start playback before the full response is generated.
+
+### Install
+
+```bash
+pip install "plapre[serve]"
+```
+
+### Start the server
+
+```bash
+plapre-serve --model plapre-nano-q8_0 --port 8000
+```
+
+Available models: `plapre-nano-f16`, `plapre-nano-q8_0` (default), `plapre-nano-q6_k`, `plapre-nano-q4_k_m`, `plapre-nano-q4_0`.
+
+### Generate speech
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hej, hvordan har du det?", "speaker": "tor"}' \
+  --output output.pcm
+
+# Convert to WAV
+ffmpeg -f s16le -ar 24000 -ac 1 -i output.pcm output.wav
+```
+
+The response is raw PCM (16-bit signed LE, 24kHz, mono) streamed per-sentence.
+
+### Other endpoints
+
+```bash
+# List available speakers
+curl http://localhost:8000/v1/speakers
+
+# List models
+curl http://localhost:8000/v1/models
+
+# Health check
+curl http://localhost:8000/health
+```
