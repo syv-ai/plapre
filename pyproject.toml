@@ -15,7 +15,6 @@ dependencies = [
     "transformers",
     "llama-cpp-python",
     "soundfile",
-    "phonemizer",
     "numpy",
     "huggingface-hub",
     "kanade-tokenizer @ git+https://github.com/frothywater/kanade-tokenizer",

@@ -4,7 +4,7 @@ Plapre – Danish TTS inference using llama.cpp for fast generation.
 Usage:
     from plapre import Plapre
 
-    tts = Plapre("syvai/plapre-turbo")
+    tts = Plapre("syvai/plapre-nano")
     tts.speak("Hej, hvordan har du det?", output="output.wav")
 
     # Voice cloning
@@ -26,7 +26,6 @@ import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from kanade_tokenizer import KanadeModel, load_vocoder, vocode
-from phonemizer import phonemize
 from transformers import AutoTokenizer
 
 import llama_cpp
@@ -54,11 +53,11 @@ HIDDEN_SIZE = 960
 KANADE_MODEL = "frothywater/kanade-25hz-clean"
 
 GGUF_VARIANTS = {
-    "f16": "gguf/plapre-turbo.f16.gguf",
-    "q8_0": "gguf/plapre-turbo.q8_0.gguf",
-    "q6_k": "gguf/plapre-turbo.q6_k.gguf",
-    "q4_k_m": "gguf/plapre-turbo.q4_k_m.gguf",
-    "q4_0": "gguf/plapre-turbo.q4_0.gguf",
+    "f16": "gguf/plapre-nano.f16.gguf",
+    "q8_0": "gguf/plapre-nano.q8_0.gguf",
+    "q6_k": "gguf/plapre-nano.q6_k.gguf",
+    "q4_k_m": "gguf/plapre-nano.q4_k_m.gguf",
+    "q4_0": "gguf/plapre-nano.q4_0.gguf",
 }
 DEFAULT_QUANT = "q8_0"
 
@@ -68,7 +67,7 @@ class Plapre:
 
     def __init__(
         self,
-        checkpoint: str = "syvai/plapre-turbo",
+        checkpoint: str = "syvai/plapre-nano",
         quant: str = DEFAULT_QUANT,
         model_path: str | None = None,
         n_gpu_layers: int = 99,
@@ -85,7 +84,8 @@ class Plapre:
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
         self.audio_token_start = self.tokenizer.convert_tokens_to_ids("<audio_0>")
         self.audio_token_end = self.tokenizer.convert_tokens_to_ids("<audio_12799>")
-        self.audio_end_id = self.tokenizer.convert_tokens_to_ids("</audio>")
+        self.text_tag = self.tokenizer.convert_tokens_to_ids("<text>")
+        self.audio_tag = self.tokenizer.convert_tokens_to_ids("<audio>")
         self.eos_id = self.tokenizer.eos_token_id
 
         # --- Speaker projection ---
@@ -112,15 +112,14 @@ class Plapre:
             raise RuntimeError(f"Failed to load GGUF model: {gguf_path}")
 
         cparams = llama_cpp.llama_context_default_params()
-        cparams.n_ctx = 8192
-        cparams.n_batch = 2048
+        cparams.n_ctx = 2048
+        cparams.n_batch = 512
         cparams.n_ubatch = 512
         cparams.n_threads = 1
         cparams.n_threads_batch = 1
         cparams.flash_attn = flash_attn
         cparams.type_k = 0  # f16
         cparams.type_v = 0
-        cparams.n_seq_max = 16
 
         self._ctx = llama_cpp.llama_init_from_model(self._model, cparams)
         if not self._ctx:
@@ -167,54 +166,25 @@ class Plapre:
 
         if split_sentences:
             sentences = self._split_sentences(text)
-            log.info("Batched generation for %d sentences", len(sentences))
-            audio = self._generate_audio_batch(sentences, spk, silence_duration, **gen_kwargs)
-            if audio is None:
+            chunks = []
+            silence = np.zeros(int(silence_duration * SAMPLE_RATE), dtype=np.float32)
+            for i, sent in enumerate(sentences):
+                log.info("Sentence %d/%d: %s", i + 1, len(sentences), sent)
+                audio = self._generate_audio(sent, spk, **gen_kwargs)
+                if audio is not None:
+                    chunks.append(audio)
+                    if i < len(sentences) - 1:
+                        chunks.append(silence)
+            if not chunks:
                 log.error("No audio generated for any sentence.")
                 return np.array([], dtype=np.float32)
+            audio = np.concatenate(chunks)
         else:
             audio = self._generate_audio(text, spk, **gen_kwargs)
             if audio is None:
                 log.error("No audio tokens generated. Try different temperature/top_p.")
                 return np.array([], dtype=np.float32)
 
-        sf.write(output, audio, SAMPLE_RATE)
-        log.info("Saved %.2fs audio to %s", len(audio) / SAMPLE_RATE, output)
-        return audio
-
-    def extract_speaker(self, wav_path: str) -> torch.Tensor:
-        """Extract a 128-dim speaker embedding from a wav file.
-
-        The returned tensor can be passed to ``speak(speaker_emb=...)``
-        for consistent voice across multiple generations.
-        """
-        return self._extract_speaker_emb(wav_path)
-
-    def replace_speaker(
-        self,
-        audio_path: str,
-        output: str = "output.wav",
-        speaker: str | None = None,
-        speaker_wav: str | None = None,
-        speaker_emb: torch.Tensor | None = None,
-    ) -> np.ndarray:
-        """Replace the speaker in an audio file while keeping the content.
-
-        Encodes *audio_path* with Kanade to extract content tokens, then
-        decodes with the target speaker embedding to produce new audio.
-        """
-        target_emb = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
-        wav = self._read_wav(audio_path)
-
-        with torch.no_grad():
-            features = self.kanade.encode(wav.to(self.device))
-            mel = self.kanade.decode(
-                content_token_indices=features.content_token_indices,
-                global_embedding=target_emb.float(),
-            )
-            waveform = vocode(self.vocoder, mel.unsqueeze(0))
-
-        audio = waveform.squeeze().cpu().numpy()
         sf.write(output, audio, SAMPLE_RATE)
         log.info("Saved %.2fs audio to %s", len(audio) / SAMPLE_RATE, output)
         return audio
@@ -260,49 +230,9 @@ class Plapre:
         self._proj_cache[key] = result
         return result
 
-    def _phonemize(self, text: str) -> str:
-        result = phonemize(
-            [text],
-            language="da",
-            backend="espeak",
-            strip=True,
-            preserve_punctuation=True,
-            language_switch="remove-flags",
-        )
-        return result[0].strip()
-
-    def _build_prompt(self, text: str, phonemes: str) -> list[int]:
-        tok = self.tokenizer
-        text_ids = tok.encode(text, add_special_tokens=False)
-
-        phone_ids = []
-        for c in phonemes:
-            tid = tok.convert_tokens_to_ids(f"<phone_{c}>")
-            if tid != tok.unk_token_id:
-                phone_ids.append(tid)
-
-        text_start = tok.convert_tokens_to_ids("<text>")
-        text_end = tok.convert_tokens_to_ids("</text>")
-        ph_start = tok.convert_tokens_to_ids("<phonemes>")
-        ph_end = tok.convert_tokens_to_ids("</phonemes>")
-        audio_start = tok.convert_tokens_to_ids("<audio>")
-
-        return (
-            [text_start] + text_ids + [text_end]
-            + [ph_start] + phone_ids + [ph_end, audio_start]
-        )
-
-    def _create_sampler(self, temperature: float, top_p: float, top_k: int):
-        sparams = llama_sampler_chain_default_params()
-        smpl = llama_sampler_chain_init(sparams)
-        if top_k > 0:
-            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k))
-        if top_p < 1.0:
-            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1))
-        if temperature > 0:
-            llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature))
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(42))
-        return smpl
+    def _build_prompt(self, text: str) -> list[int]:
+        text_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        return [self.text_tag] + text_ids + [self.audio_tag]
 
     def _generate_tokens(
         self,
@@ -313,7 +243,7 @@ class Plapre:
         top_k: int,
         max_tokens: int,
     ) -> list[int]:
-        """Generate audio token IDs using llama.cpp (single sequence)."""
+        """Generate audio token IDs using llama.cpp."""
         llama_kv_self_clear(self._ctx)
 
         n_prompt = len(prompt_tokens)
@@ -346,13 +276,22 @@ class Plapre:
             llama_batch_free(batch)
             raise RuntimeError(f"Prompt decode failed: {rc}")
 
-        smpl = self._create_sampler(temperature, top_p, top_k)
+        # Sampler
+        sparams = llama_sampler_chain_default_params()
+        smpl = llama_sampler_chain_init(sparams)
+        if top_k > 0:
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k))
+        if top_p < 1.0:
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1))
+        if temperature > 0:
+            llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature))
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(42))
 
         generated = []
         pos = 1 + n_prompt
         for _ in range(max_tokens):
             new_token = llama_sampler_sample(smpl, self._ctx, -1)
-            if new_token == self.audio_end_id or new_token == self.eos_id:
+            if new_token == self.eos_id:
                 break
             generated.append(new_token)
 
@@ -372,119 +311,6 @@ class Plapre:
         llama_batch_free(batch)
         return generated
 
-    def _generate_tokens_batch(
-        self,
-        prompt_tokens_list: list[list[int]],
-        speaker_hidden: np.ndarray,
-        temperature: float,
-        top_p: float,
-        top_k: int,
-        max_tokens: int,
-    ) -> list[list[int]]:
-        """Generate audio tokens for multiple prompts in parallel."""
-        batch_size = len(prompt_tokens_list)
-        if batch_size == 1:
-            return [self._generate_tokens(
-                prompt_tokens_list[0], speaker_hidden, temperature, top_p, top_k, max_tokens,
-            )]
-
-        llama_kv_self_clear(self._ctx)
-        total_prompt_tokens = sum(len(p) for p in prompt_tokens_list)
-
-        # Decode speaker embeddings for all sequences at position 0
-        embd_batch = llama_batch_init(batch_size, HIDDEN_SIZE, 1)
-        embd_batch.n_tokens = batch_size
-        for seq_id in range(batch_size):
-            dst_ptr = ctypes.addressof(embd_batch.embd.contents) + seq_id * HIDDEN_SIZE * 4
-            ctypes.memmove(dst_ptr, speaker_hidden.ctypes.data, HIDDEN_SIZE * 4)
-            embd_batch.pos[seq_id] = 0
-            embd_batch.n_seq_id[seq_id] = 1
-            embd_batch.seq_id[seq_id][0] = seq_id
-            embd_batch.logits[seq_id] = 0
-
-        rc = llama_decode(self._ctx, embd_batch)
-        llama_batch_free(embd_batch)
-        if rc != 0:
-            raise RuntimeError(f"Batch speaker embedding decode failed: {rc}")
-
-        # Decode all prompt tokens at positions 1..N per sequence
-        batch = llama_batch_init(max(total_prompt_tokens + 64, batch_size * 2), 0, 1)
-        idx = 0
-        for seq_id, prompt in enumerate(prompt_tokens_list):
-            for pos, tid in enumerate(prompt):
-                batch.token[idx] = tid
-                batch.pos[idx] = pos + 1
-                batch.n_seq_id[idx] = 1
-                batch.seq_id[idx][0] = seq_id
-                batch.logits[idx] = 1 if pos == len(prompt) - 1 else 0
-                idx += 1
-        batch.n_tokens = idx
-
-        rc = llama_decode(self._ctx, batch)
-        if rc != 0:
-            llama_batch_free(batch)
-            raise RuntimeError(f"Batch prompt decode failed: {rc}")
-
-        # Per-sequence samplers
-        samplers = [self._create_sampler(temperature, top_p, top_k) for _ in range(batch_size)]
-
-        generated = [[] for _ in range(batch_size)]
-        finished = [False] * batch_size
-        positions = [1 + len(p) for p in prompt_tokens_list]
-
-        # Sample first token for each sequence
-        logits_indices = []
-        offset = 0
-        for seq_id, prompt in enumerate(prompt_tokens_list):
-            logits_indices.append(offset + len(prompt) - 1)
-            offset += len(prompt)
-
-        for seq_id in range(batch_size):
-            new_token = llama_sampler_sample(samplers[seq_id], self._ctx, logits_indices[seq_id])
-            if new_token == self.audio_end_id or new_token == self.eos_id:
-                finished[seq_id] = True
-            else:
-                generated[seq_id].append(new_token)
-
-        # Autoregressive loop
-        for _ in range(max_tokens - 1):
-            if all(finished):
-                break
-
-            idx = 0
-            active = []
-            for seq_id in range(batch_size):
-                if finished[seq_id]:
-                    continue
-                batch.token[idx] = generated[seq_id][-1]
-                batch.pos[idx] = positions[seq_id]
-                batch.n_seq_id[idx] = 1
-                batch.seq_id[idx][0] = seq_id
-                batch.logits[idx] = 1
-                active.append((seq_id, idx))
-                idx += 1
-                positions[seq_id] += 1
-
-            if idx == 0:
-                break
-            batch.n_tokens = idx
-
-            rc = llama_decode(self._ctx, batch)
-            if rc != 0:
-                break
-
-            for seq_id, batch_idx in active:
-                new_token = llama_sampler_sample(samplers[seq_id], self._ctx, batch_idx)
-                if new_token == self.audio_end_id or new_token == self.eos_id:
-                    finished[seq_id] = True
-                else:
-                    generated[seq_id].append(new_token)
-
-        for smpl in samplers:
-            llama_sampler_free(smpl)
-        llama_batch_free(batch)
-        return generated
-
     def _generate_audio(
         self,
         text: str,
@@ -494,8 +320,7 @@ class Plapre:
         top_k: int,
         max_tokens: int,
     ) -> np.ndarray | None:
-        phonemes = self._phonemize(text)
-        prompt_ids = self._build_prompt(text, phonemes)
+        prompt_ids = self._build_prompt(text)
         speaker_hidden = self._project_speaker(speaker_emb)
 
         generated = self._generate_tokens(
@@ -521,53 +346,7 @@ class Plapre:
 
         return waveform.squeeze().cpu().numpy()
 
-    def _generate_audio_batch(
-        self,
-        sentences: list[str],
-        speaker_emb: torch.Tensor,
-        silence_duration: float,
-        temperature: float,
-        top_p: float,
-        top_k: int,
-        max_tokens: int,
-    ) -> np.ndarray | None:
-        prompt_list = []
-        for sent in sentences:
-            phonemes = self._phonemize(sent)
-            prompt_list.append(self._build_prompt(sent, phonemes))
-
-        speaker_hidden = self._project_speaker(speaker_emb)
-        all_generated = self._generate_tokens_batch(
-            prompt_list, speaker_hidden, temperature, top_p, top_k, max_tokens,
-        )
-
-        silence = np.zeros(int(silence_duration * SAMPLE_RATE), dtype=np.float32)
-        chunks = []
-        for i, generated in enumerate(all_generated):
-            kanade_indices = [
-                tid - self.audio_token_start
-                for tid in generated
-                if self.audio_token_start <= tid <= self.audio_token_end
-            ]
-            if not kanade_indices:
-                continue
-            tokens_tensor = torch.tensor(kanade_indices, dtype=torch.long, device=self.device)
-            with torch.no_grad():
-                mel = self.kanade.decode(
-                    content_token_indices=tokens_tensor,
-                    global_embedding=speaker_emb.float().to(self.device),
-                )
-                waveform = vocode(self.vocoder, mel.unsqueeze(0))
-            chunks.append(waveform.squeeze().cpu().numpy())
-            if i < len(all_generated) - 1:
-                chunks.append(silence)
-
-        if not chunks:
-            return None
-        return np.concatenate(chunks)
-
-    @staticmethod
-    def _read_wav(wav_path: str) -> torch.Tensor:
+    def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
         import torchaudio
 
         data, sr = sf.read(wav_path, dtype="float32")
@@ -580,10 +359,6 @@ class Plapre:
             wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
-        return wav
-
-    def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
-        wav = self._read_wav(wav_path)
         with torch.no_grad():
             features = self.kanade.encode(wav.to(self.device))
         return features.global_embedding
