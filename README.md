@@ -104,7 +104,7 @@ Plapre includes a FastAPI server that streams raw PCM audio with chunked transfe
 ### Install
 
 ```bash
-pip install "plapre[serve]"
+uv add "plapre[serve] @ git+https://github.com/syv-ai/plapre.git"
 ```
 
 ### Start the server
