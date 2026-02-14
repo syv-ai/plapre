@@ -34,12 +34,19 @@ Or use a local GGUF file:
 tts = Plapre("syvai/plapre-nano", model_path="/path/to/model.gguf")
 ```
 
+### List available speakers
+
+```python
+print(tts.list_speakers())
+# ['tor', 'ida', 'liv', 'ask', 'kaj']
+```
+
 ### Choose a speaker
 
 Built-in speakers are loaded from the package. The first speaker is used by default.
 
 ```python
-tts.speak("Hej med dig.", output="output.wav", speaker="nic")
+tts.speak("Hej med dig.", output="output.wav", speaker="ida")
 ```
 
 ### Voice cloning

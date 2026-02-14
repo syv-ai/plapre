@@ -145,6 +145,10 @@ class Plapre:
     # Public API
     # ------------------------------------------------------------------
 
+    def list_speakers(self) -> list[str]:
+        """Return a list of available built-in speaker names."""
+        return list(self.speakers.keys())
+
     def speak(
         self,
         text: str,
