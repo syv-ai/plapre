@@ -127,7 +127,7 @@ async def speech(req: SpeechRequest):
     if not sentences:
         raise HTTPException(status_code=400, detail="No text provided")
 
-    silence_samples = int(0.3 * SAMPLE_RATE)
+    silence_samples = int(0.1 * SAMPLE_RATE)
     silence_bytes = struct.pack(f"<{silence_samples}h", *([0] * silence_samples))
 
     async def generate():
