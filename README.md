@@ -71,6 +71,16 @@ tts.speak(
 )
 ```
 
+### Extract a speaker embedding
+
+Extract a 128-dim speaker embedding from a wav file, then reuse it across multiple generations:
+
+```python
+speaker_emb = tts.extract_speaker("reference.wav")
+tts.speak("Hej.", output="a.wav", speaker_emb=speaker_emb)
+tts.speak("Farvel.", output="b.wav", speaker_emb=speaker_emb)
+```
+
 ### Return value
 
 `speak()` returns the audio as a numpy array (24 kHz, float32), in addition to saving the file:
