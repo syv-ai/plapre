@@ -108,15 +108,14 @@ class Plapre:
             raise RuntimeError(f"Failed to load GGUF model: {gguf_path}")
 
         cparams = llama_cpp.llama_context_default_params()
-        cparams.n_ctx = 2048 * MAX_PARALLEL_SENTENCES
+        cparams.n_ctx = 512 * MAX_PARALLEL_SENTENCES
         cparams.n_seq_max = MAX_PARALLEL_SENTENCES
         cparams.n_batch = 2048
         cparams.n_ubatch = 2048
         cparams.n_threads = 1
         cparams.n_threads_batch = 1
-        # Flash attention requires head count to be even; disable for models
-        # with odd num_attention_heads (e.g. pico with 9 heads) where the
-        # CUDA flash-attn kernel falls back to a slow path.
+        # Flash attention with odd head counts (e.g. pico with 9 heads)
+        # is slightly slower on CUDA, so disable it for those models.
         n_heads = llama_cpp.llama_model_n_head(self._model)
         if flash_attn and n_heads % 2 != 0:
             log.info("Disabling flash_attn (num_heads=%d is odd)", n_heads)
@@ -485,7 +484,7 @@ class Plapre:
             prompts, speaker_hidden, temperature, top_p, top_k, max_tokens,
         )
 
-        return [self._tokens_to_audio(gen, speaker_emb) for gen in all_generated]
+        return self._tokens_to_audio_batch(all_generated, speaker_emb)
 
     def _tokens_to_audio(
         self, generated: list[int], speaker_emb: torch.Tensor,
@@ -509,6 +508,64 @@ class Plapre:
             waveform = vocode(self.vocoder, mel.unsqueeze(0))
 
         return waveform.squeeze().cpu().numpy()
+
+    def _tokens_to_audio_batch(
+        self, all_generated: list[list[int]], speaker_emb: torch.Tensor,
+    ) -> list[np.ndarray | None]:
+        """Convert multiple sets of generated token IDs to audio, batching vocoder calls."""
+        # Extract kanade indices for each sequence
+        all_indices = []
+        valid_mask = []
+        for generated in all_generated:
+            indices = [
+                tid - self.audio_token_start
+                for tid in generated
+                if self.audio_token_start <= tid <= self.audio_token_end
+            ]
+            all_indices.append(indices)
+            valid_mask.append(len(indices) > 0)
+
+        if not any(valid_mask):
+            return [None] * len(all_generated)
+
+        spk_emb = speaker_emb.float().to(self.device)
+
+        # Decode mels individually (different lengths), then batch vocode
+        with torch.no_grad():
+            mels = []
+            mel_lengths = []
+            for i, indices in enumerate(all_indices):
+                if not valid_mask[i]:
+                    continue
+                tokens_tensor = torch.tensor(indices, dtype=torch.long, device=self.device)
+                mel = self.kanade.decode(
+                    content_token_indices=tokens_tensor,
+                    global_embedding=spk_emb,
+                )
+                mels.append(mel)
+                mel_lengths.append(mel.shape[-1])
+
+            # Pad mels to same length and batch vocode
+            max_len = max(mel_lengths)
+            n_mels = mels[0].shape[0]
+            padded = torch.zeros(len(mels), n_mels, max_len, device=self.device)
+            for i, mel in enumerate(mels):
+                padded[i, :, :mel.shape[-1]] = mel
+
+            waveforms = vocode(self.vocoder, padded)
+
+        # Unpad waveforms based on mel lengths and return
+        samples_per_frame = waveforms.shape[-1] // max_len if max_len > 0 else 0
+        results: list[np.ndarray | None] = []
+        mel_idx = 0
+        for i in range(len(all_generated)):
+            if not valid_mask[i]:
+                results.append(None)
+            else:
+                n_samples = mel_lengths[mel_idx] * samples_per_frame
+                results.append(waveforms[mel_idx, :n_samples].cpu().numpy())
+                mel_idx += 1
+        return results
 
     def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
         import torchaudio
