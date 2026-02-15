@@ -9,6 +9,15 @@ Danish text-to-speech synthesis. Uses llama.cpp for fast inference.
 uv add git+https://github.com/syv-ai/plapre.git
 ```
 
+## Models
+
+| Model | Parameters | HuggingFace | Description |
+|-------|-----------|-------------|-------------|
+| Plapre Nano | ~327M | [syvai/plapre-nano](https://huggingface.co/syvai/plapre-nano) | Larger, higher quality |
+| Plapre Pico | ~118M | [syvai/plapre-pico](https://huggingface.co/syvai/plapre-pico) | Smaller, faster inference |
+
+Both models support the same quants: `f16`, `q8_0` (default), `q6_k`, `q4_k_m`, `q4_0`. GGUF files are downloaded automatically from HuggingFace.
+
 ## Usage
 
 ### Basic
@@ -16,22 +25,27 @@ uv add git+https://github.com/syv-ai/plapre.git
 ```python
 from plapre import Plapre
 
+# Load the smaller, faster model
+tts = Plapre("syvai/plapre-pico")
+tts.speak("Hej, hvordan har du det?", output="output.wav")
+
+# Or the larger model
 tts = Plapre("syvai/plapre-nano")
 tts.speak("Hej, hvordan har du det?", output="output.wav")
 ```
 
 ### Quantization
 
-GGUF models are downloaded automatically. Available quants: `f16`, `q8_0` (default), `q6_k`, `q4_k_m`, `q4_0`.
-
 ```python
-tts = Plapre("syvai/plapre-nano", quant="q4_k_m")
+# Use a specific quant
+tts = Plapre("syvai/plapre-pico", quant="q4_k_m")
+tts = Plapre("syvai/plapre-nano", quant="q8_0")
 ```
 
 Or use a local GGUF file:
 
 ```python
-tts = Plapre("syvai/plapre-nano", model_path="/path/to/model.gguf")
+tts = Plapre("syvai/plapre-pico", model_path="/path/to/model.gguf")
 ```
 
 ### List available speakers
@@ -110,10 +124,14 @@ uv add "plapre[serve] @ git+https://github.com/syv-ai/plapre.git"
 ### Start the server
 
 ```bash
+# Pico (smaller, faster)
+plapre-serve --model plapre-pico-q8_0 --port 8000
+
+# Nano (larger, higher quality)
 plapre-serve --model plapre-nano-q8_0 --port 8000
 ```
 
-Available models: `plapre-nano-f16`, `plapre-nano-q8_0` (default), `plapre-nano-q6_k`, `plapre-nano-q4_k_m`, `plapre-nano-q4_0`.
+Available models: `plapre-pico-{f16,q8_0,q6_k,q4_k_m,q4_0}`, `plapre-nano-{f16,q8_0,q6_k,q4_k_m,q4_0}`.
 
 ### Generate speech
 

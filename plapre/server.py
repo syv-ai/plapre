@@ -29,13 +29,18 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MODELS = {
+    "plapre-pico-f16": ("syvai/plapre-pico", "f16"),
+    "plapre-pico-q8_0": ("syvai/plapre-pico", "q8_0"),
+    "plapre-pico-q6_k": ("syvai/plapre-pico", "q6_k"),
+    "plapre-pico-q4_k_m": ("syvai/plapre-pico", "q4_k_m"),
+    "plapre-pico-q4_0": ("syvai/plapre-pico", "q4_0"),
     "plapre-nano-f16": ("syvai/plapre-nano", "f16"),
     "plapre-nano-q8_0": ("syvai/plapre-nano", "q8_0"),
     "plapre-nano-q6_k": ("syvai/plapre-nano", "q6_k"),
     "plapre-nano-q4_k_m": ("syvai/plapre-nano", "q4_k_m"),
     "plapre-nano-q4_0": ("syvai/plapre-nano", "q4_0"),
 }
-DEFAULT_MODEL = "plapre-nano-q8_0"
+DEFAULT_MODEL = "plapre-pico-q8_0"
 
 # ---------------------------------------------------------------------------
 # Global state
