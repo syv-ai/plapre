@@ -52,13 +52,7 @@ SPEAKER_DIM = 128
 HIDDEN_SIZE = 960
 KANADE_MODEL = "frothywater/kanade-25hz-clean"
 
-GGUF_VARIANTS = {
-    "f16": "gguf/plapre-nano.f16.gguf",
-    "q8_0": "gguf/plapre-nano.q8_0.gguf",
-    "q6_k": "gguf/plapre-nano.q6_k.gguf",
-    "q4_k_m": "gguf/plapre-nano.q4_k_m.gguf",
-    "q4_0": "gguf/plapre-nano.q4_0.gguf",
-}
+GGUF_QUANTS = ["f16", "q8_0", "q6_k", "q4_k_m", "q4_0"]
 DEFAULT_QUANT = "q8_0"
 
 
@@ -90,6 +84,7 @@ class Plapre:
 
         # --- Speaker projection ---
         self.speaker_proj = self._load_speaker_proj(checkpoint)
+        self._hidden_size = self.speaker_proj.out_features  # inferred: 576 (pico) or 960 (nano)
         self.speakers = self._load_speakers()
         self.default_speaker = next(iter(self.speakers))
         log.info(
@@ -199,10 +194,14 @@ class Plapre:
 
     @staticmethod
     def _resolve_gguf(checkpoint: str, quant: str) -> str:
-        local = Path(checkpoint) / GGUF_VARIANTS.get(quant, GGUF_VARIANTS[DEFAULT_QUANT])
+        if quant not in GGUF_QUANTS:
+            quant = DEFAULT_QUANT
+        # Derive model name from checkpoint: "syvai/plapre-pico" -> "plapre-pico"
+        model_name = checkpoint.rstrip("/").split("/")[-1]
+        repo_path = f"gguf/{model_name}.{quant}.gguf"
+        local = Path(checkpoint) / repo_path
         if local.exists():
             return str(local)
-        repo_path = GGUF_VARIANTS.get(quant, GGUF_VARIANTS[DEFAULT_QUANT])
         return hf_hub_download(checkpoint, repo_path)
 
     def _load_speakers(self) -> dict[str, torch.Tensor]:
@@ -215,13 +214,15 @@ class Plapre:
         }
 
     def _load_speaker_proj(self, checkpoint: str) -> nn.Linear:
-        proj = nn.Linear(SPEAKER_DIM, HIDDEN_SIZE)
         local = Path(checkpoint) / "speaker_proj.pt"
         if local.exists():
-            proj.load_state_dict(torch.load(local, map_location="cpu"))
+            state = torch.load(local, map_location="cpu")
         else:
             path = hf_hub_download(checkpoint, "speaker_proj.pt")
-            proj.load_state_dict(torch.load(path, map_location="cpu"))
+            state = torch.load(path, map_location="cpu")
+        hidden_size = state["weight"].shape[0]
+        proj = nn.Linear(SPEAKER_DIM, hidden_size)
+        proj.load_state_dict(state)
         return proj.to(torch.bfloat16).eval()
 
     @torch.no_grad()
@@ -253,9 +254,9 @@ class Plapre:
         n_prompt = len(prompt_tokens)
 
         # Decode speaker embedding at position 0
-        embd_batch = llama_batch_init(1, HIDDEN_SIZE, 1)
+        embd_batch = llama_batch_init(1, self._hidden_size, 1)
         embd_batch.n_tokens = 1
-        ctypes.memmove(embd_batch.embd, speaker_hidden.ctypes.data, HIDDEN_SIZE * 4)
+        ctypes.memmove(embd_batch.embd, speaker_hidden.ctypes.data, self._hidden_size * 4)
         embd_batch.pos[0] = 0
         embd_batch.n_seq_id[0] = 1
         embd_batch.seq_id[0][0] = 0
