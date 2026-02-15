@@ -54,6 +54,7 @@ KANADE_MODEL = "frothywater/kanade-25hz-clean"
 
 GGUF_QUANTS = ["f16", "q8_0", "q6_k", "q4_k_m", "q4_0"]
 DEFAULT_QUANT = "q8_0"
+MAX_PARALLEL_SENTENCES = 16
 
 
 class Plapre:
@@ -107,9 +108,10 @@ class Plapre:
             raise RuntimeError(f"Failed to load GGUF model: {gguf_path}")
 
         cparams = llama_cpp.llama_context_default_params()
-        cparams.n_ctx = 2048
-        cparams.n_batch = 512
-        cparams.n_ubatch = 512
+        cparams.n_ctx = 2048 * MAX_PARALLEL_SENTENCES
+        cparams.n_seq_max = MAX_PARALLEL_SENTENCES
+        cparams.n_batch = 2048
+        cparams.n_ubatch = 2048
         cparams.n_threads = 1
         cparams.n_threads_batch = 1
         # Flash attention requires head count to be even; disable for models
@@ -151,6 +153,10 @@ class Plapre:
         """Return a list of available built-in speaker names."""
         return list(self.speakers.keys())
 
+    def extract_speaker(self, wav_path: str) -> torch.Tensor:
+        """Extract a 128-dim speaker embedding from a wav file."""
+        return self._extract_speaker_emb(wav_path)
+
     def speak(
         self,
         text: str,
@@ -172,14 +178,14 @@ class Plapre:
 
         if split_sentences:
             sentences = self._split_sentences(text)
+            log.info("Generating %d sentences in parallel", len(sentences))
+            audios = self._generate_audio_batch(sentences, spk, **gen_kwargs)
             chunks = []
             silence = np.zeros(int(silence_duration * SAMPLE_RATE), dtype=np.float32)
-            for i, sent in enumerate(sentences):
-                log.info("Sentence %d/%d: %s", i + 1, len(sentences), sent)
-                audio = self._generate_audio(sent, spk, **gen_kwargs)
-                if audio is not None:
-                    chunks.append(audio)
-                    if i < len(sentences) - 1:
+            for i, a in enumerate(audios):
+                if a is not None:
+                    chunks.append(a)
+                    if i < len(audios) - 1:
                         chunks.append(silence)
             if not chunks:
                 log.error("No audio generated for any sentence.")
@@ -323,6 +329,127 @@ class Plapre:
         llama_batch_free(batch)
         return generated
 
+    def _generate_tokens_batch(
+        self,
+        prompts: list[list[int]],
+        speaker_hidden: np.ndarray,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_tokens: int,
+    ) -> list[list[int]]:
+        """Generate audio tokens for multiple prompts in parallel."""
+        n_seqs = len(prompts)
+        llama_kv_self_clear(self._ctx)
+
+        # --- Decode speaker embedding at position 0 for ALL sequences ---
+        embd_batch = llama_batch_init(n_seqs, self._hidden_size, n_seqs)
+        embd_batch.n_tokens = n_seqs
+        for s in range(n_seqs):
+            offset = s * self._hidden_size * 4
+            ctypes.memmove(
+                ctypes.cast(embd_batch.embd, ctypes.c_void_p).value + offset,
+                speaker_hidden.ctypes.data,
+                self._hidden_size * 4,
+            )
+            embd_batch.pos[s] = 0
+            embd_batch.n_seq_id[s] = 1
+            embd_batch.seq_id[s][0] = s
+            embd_batch.logits[s] = 0
+        rc = llama_decode(self._ctx, embd_batch)
+        llama_batch_free(embd_batch)
+        if rc != 0:
+            raise RuntimeError(f"Speaker embedding decode failed: {rc}")
+
+        # --- Decode all prompts ---
+        total_prompt_tokens = sum(len(p) for p in prompts)
+        batch = llama_batch_init(max(total_prompt_tokens, n_seqs * 512), 0, n_seqs)
+        batch.n_tokens = total_prompt_tokens
+        idx = 0
+        for s, prompt in enumerate(prompts):
+            for i, tid in enumerate(prompt):
+                batch.token[idx] = tid
+                batch.pos[idx] = i + 1  # pos 0 is speaker embedding
+                batch.n_seq_id[idx] = 1
+                batch.seq_id[idx][0] = s
+                batch.logits[idx] = 1 if i == len(prompt) - 1 else 0
+                idx += 1
+
+        rc = llama_decode(self._ctx, batch)
+        if rc != 0:
+            llama_batch_free(batch)
+            raise RuntimeError(f"Batch prompt decode failed: {rc}")
+
+        # --- Create per-sequence samplers ---
+        samplers = []
+        for _ in range(n_seqs):
+            sparams = llama_sampler_chain_default_params()
+            smpl = llama_sampler_chain_init(sparams)
+            if top_k > 0:
+                llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k))
+            if top_p < 1.0:
+                llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1))
+            if temperature > 0:
+                llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature))
+            llama_sampler_chain_add(smpl, llama_sampler_init_dist(42))
+            samplers.append(smpl)
+
+        # --- Autoregressive generation ---
+        generated: list[list[int]] = [[] for _ in range(n_seqs)]
+        positions = [1 + len(p) for p in prompts]  # next position per seq
+        active = list(range(n_seqs))  # sequences still generating
+
+        # Find the logit indices from the prompt decode (last token of each seq)
+        logit_indices: dict[int, int] = {}
+        idx = 0
+        for s, prompt in enumerate(prompts):
+            idx += len(prompt)
+            logit_indices[s] = idx - 1
+
+        for _ in range(max_tokens):
+            if not active:
+                break
+
+            # Sample from each active sequence
+            new_tokens: dict[int, int | None] = {}
+            for s in active:
+                new_token = llama_sampler_sample(samplers[s], self._ctx, logit_indices[s])
+                if new_token == self.eos_id:
+                    new_tokens[s] = None
+                else:
+                    new_tokens[s] = new_token
+                    generated[s].append(new_token)
+
+            # Remove finished sequences
+            active = [s for s in active if new_tokens.get(s) is not None]
+            if not active:
+                break
+
+            # Decode new tokens for all active sequences in one batch
+            batch.n_tokens = len(active)
+            for i, s in enumerate(active):
+                batch.token[i] = new_tokens[s]
+                batch.pos[i] = positions[s]
+                batch.n_seq_id[i] = 1
+                batch.seq_id[i][0] = s
+                batch.logits[i] = 1
+            for s in active:
+                positions[s] += 1
+
+            rc = llama_decode(self._ctx, batch)
+            if rc != 0:
+                break
+
+            # Update logit indices for next sampling round
+            logit_indices = {}
+            for i, s in enumerate(active):
+                logit_indices[s] = i
+
+        for smpl in samplers:
+            llama_sampler_free(smpl)
+        llama_batch_free(batch)
+        return generated
+
     def _generate_audio(
         self,
         text: str,
@@ -339,6 +466,31 @@ class Plapre:
             prompt_ids, speaker_hidden, temperature, top_p, top_k, max_tokens,
         )
 
+        return self._tokens_to_audio(generated, speaker_emb)
+
+    def _generate_audio_batch(
+        self,
+        texts: list[str],
+        speaker_emb: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_tokens: int,
+    ) -> list[np.ndarray | None]:
+        """Generate audio for multiple texts in parallel."""
+        prompts = [self._build_prompt(t) for t in texts]
+        speaker_hidden = self._project_speaker(speaker_emb)
+
+        all_generated = self._generate_tokens_batch(
+            prompts, speaker_hidden, temperature, top_p, top_k, max_tokens,
+        )
+
+        return [self._tokens_to_audio(gen, speaker_emb) for gen in all_generated]
+
+    def _tokens_to_audio(
+        self, generated: list[int], speaker_emb: torch.Tensor,
+    ) -> np.ndarray | None:
+        """Convert generated token IDs to audio waveform."""
         kanade_indices = [
             tid - self.audio_token_start
             for tid in generated

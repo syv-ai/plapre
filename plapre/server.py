@@ -138,14 +138,14 @@ async def speech(req: SpeechRequest):
 
     async def generate():
         async with _lock:
-            for i, sent in enumerate(sentences):
-                log.info("Generating sentence %d/%d: %s", i + 1, len(sentences), sent)
-                audio = await asyncio.to_thread(
-                    _tts._generate_audio, sent, spk, **gen_kwargs,
-                )
+            log.info("Generating %d sentences in batch: %s", len(sentences), sentences)
+            audios = await asyncio.to_thread(
+                _tts._generate_audio_batch, sentences, spk, **gen_kwargs,
+            )
+            for i, audio in enumerate(audios):
                 if audio is not None:
                     yield _float32_to_pcm16(audio)
-                    if i < len(sentences) - 1:
+                    if i < len(audios) - 1:
                         yield silence_bytes
 
     return StreamingResponse(
