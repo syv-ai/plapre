@@ -112,6 +112,13 @@ class Plapre:
         cparams.n_ubatch = 512
         cparams.n_threads = 1
         cparams.n_threads_batch = 1
+        # Flash attention requires head count to be even; disable for models
+        # with odd num_attention_heads (e.g. pico with 9 heads) where the
+        # CUDA flash-attn kernel falls back to a slow path.
+        n_heads = llama_cpp.llama_model_n_head(self._model)
+        if flash_attn and n_heads % 2 != 0:
+            log.info("Disabling flash_attn (num_heads=%d is odd)", n_heads)
+            flash_attn = False
         cparams.flash_attn = flash_attn
         cparams.type_k = 0  # f16
         cparams.type_v = 0
