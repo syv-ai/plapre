@@ -54,7 +54,7 @@ KANADE_MODEL = "frothywater/kanade-25hz-clean"
 
 GGUF_QUANTS = ["f16", "q8_0", "q6_k", "q4_k_m", "q4_0"]
 DEFAULT_QUANT = "q8_0"
-MAX_PARALLEL_SENTENCES = 16
+MAX_PARALLEL_SENTENCES = 32
 
 
 class Plapre:
