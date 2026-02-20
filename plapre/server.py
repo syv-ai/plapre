@@ -40,11 +40,13 @@ async def lifespan(app: FastAPI):
     global _tts
 
     checkpoint = os.environ.get("PLAPRE_CHECKPOINT", "syvai/plapre-nano")
+    quant = os.environ.get("PLAPRE_QUANT", "q8_0")
     gpu_mem = float(os.environ.get("PLAPRE_GPU_MEM", "0.5"))
     max_len = int(os.environ.get("PLAPRE_MAX_MODEL_LEN", "512"))
-    log.info("Loading model %s (gpu_mem=%.2f, max_len=%d) …", checkpoint, gpu_mem, max_len)
+    log.info("Loading model %s (quant=%s, gpu_mem=%.2f, max_len=%d) …", checkpoint, quant, gpu_mem, max_len)
     _tts = Plapre(
         checkpoint=checkpoint,
+        quant=quant,
         gpu_memory_utilization=gpu_mem,
         max_model_len=max_len,
     )
