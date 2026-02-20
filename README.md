@@ -1,6 +1,6 @@
 # Plapre
 
-Danish text-to-speech synthesis. Uses llama.cpp for fast inference.
+Danish text-to-speech synthesis. Uses vLLM for fast batched inference.
 
 ## Prerequisites
 
@@ -17,8 +17,9 @@ The Plapre models are hosted as **gated models** on Hugging Face. Before using P
 
 ## Installation
 
+Requires Python >= 3.12 and a CUDA GPU.
+
 ```bash
-# Install plapre
 uv add git+https://github.com/syv-ai/plapre.git
 ```
 
@@ -29,8 +30,6 @@ uv add git+https://github.com/syv-ai/plapre.git
 | Plapre Nano | ~327M | [syvai/plapre-nano](https://huggingface.co/syvai/plapre-nano) | Larger, higher quality |
 | Plapre Pico | ~118M | [syvai/plapre-pico](https://huggingface.co/syvai/plapre-pico) | Smaller, faster inference |
 
-Both models support the same quants: `f16`, `q8_0` (default), `q6_k`, `q4_k_m`, `q4_0`. GGUF files are downloaded automatically from HuggingFace.
-
 ## Usage
 
 ### Basic
@@ -38,34 +37,16 @@ Both models support the same quants: `f16`, `q8_0` (default), `q6_k`, `q4_k_m`, 
 ```python
 from plapre import Plapre
 
-# Load the smaller, faster model
-tts = Plapre("syvai/plapre-pico")
-tts.speak("Hej, hvordan har du det?", output="output.wav")
-
-# Or the larger model
 tts = Plapre("syvai/plapre-nano")
 tts.speak("Hej, hvordan har du det?", output="output.wav")
 ```
 
-### Quantization
+### GPU memory
 
 ```python
-# Use a specific quant
-tts = Plapre("syvai/plapre-pico", quant="q4_k_m")
-tts = Plapre("syvai/plapre-nano", quant="q8_0")
-```
-
-Or use a local GGUF file:
-
-```python
-tts = Plapre("syvai/plapre-pico", model_path="/path/to/model.gguf")
-```
-
-### List available speakers
-
-```python
-print(tts.list_speakers())
-# ['tor', 'ida', 'liv', 'ask', 'kaj']
+# Adjust GPU memory allocated to vLLM (default: 0.4)
+# Leave headroom for the Kanade vocoder (~400 MiB)
+tts = Plapre("syvai/plapre-nano", gpu_memory_utilization=0.5)
 ```
 
 ### Choose a speaker
@@ -73,7 +54,7 @@ print(tts.list_speakers())
 Built-in speakers are loaded from the package. The first speaker is used by default.
 
 ```python
-tts.speak("Hej med dig.", output="output.wav", speaker="ida")
+tts.speak("Hej med dig.", output="output.wav", speaker="mic")
 ```
 
 ### Voice cloning
@@ -83,6 +64,8 @@ tts.speak("Hej med dig.", output="cloned.wav", speaker_wav="reference.wav")
 ```
 
 ### Long text with sentence splitting
+
+Sentences are batched together in a single vLLM call for higher throughput.
 
 ```python
 tts.speak(
@@ -137,21 +120,20 @@ uv add "plapre[serve] @ git+https://github.com/syv-ai/plapre.git"
 ### Start the server
 
 ```bash
-# Pico (smaller, faster)
-plapre-serve --model plapre-pico-q8_0 --port 8000
+plapre-serve --port 8000
 
-# Nano (larger, higher quality)
-plapre-serve --model plapre-nano-q8_0 --port 8000
+# Or with a specific checkpoint and GPU memory settings
+plapre-serve --checkpoint syvai/plapre-nano --gpu-mem 0.5 --port 8000
 ```
 
-Available models: `plapre-pico-{f16,q8_0,q6_k,q4_k_m,q4_0}`, `plapre-nano-{f16,q8_0,q6_k,q4_k_m,q4_0}`.
+Configuration via environment variables is also supported: `PLAPRE_CHECKPOINT`, `PLAPRE_GPU_MEM`, `PLAPRE_MAX_MODEL_LEN`.
 
 ### Generate speech
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hej, hvordan har du det?", "speaker": "tor"}' \
+  -d '{"text": "Hej, hvordan har du det?", "speaker": "mic"}' \
   --output output.pcm
 
 # Convert to WAV
@@ -165,9 +147,6 @@ The response is raw PCM (16-bit signed LE, 24kHz, mono) streamed per-sentence.
 ```bash
 # List available speakers
 curl http://localhost:8000/v1/speakers
-
-# List models
-curl http://localhost:8000/v1/models
 
 # Health check
 curl http://localhost:8000/health
