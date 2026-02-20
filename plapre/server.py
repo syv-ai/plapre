@@ -15,6 +15,7 @@ import struct
 from contextlib import asynccontextmanager
 
 import numpy as np
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -28,7 +29,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _tts: Plapre | None = None
-_lock = asyncio.Lock()
+_vocoder_sem: asyncio.Semaphore | None = None
+_async_mode: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -37,20 +39,26 @@ _lock = asyncio.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tts
+    global _tts, _vocoder_sem, _async_mode
 
     checkpoint = os.environ.get("PLAPRE_CHECKPOINT", "syvai/plapre-nano")
     quant = os.environ.get("PLAPRE_QUANT", "q8_0")
     gpu_mem = float(os.environ.get("PLAPRE_GPU_MEM", "0.5"))
     max_len = int(os.environ.get("PLAPRE_MAX_MODEL_LEN", "512"))
-    log.info("Loading model %s (quant=%s, gpu_mem=%.2f, max_len=%d) …", checkpoint, quant, gpu_mem, max_len)
+    _async_mode = os.environ.get("PLAPRE_ASYNC", "1") == "1"
+    mode_str = "async" if _async_mode else "sync"
+    log.info("Loading model %s (quant=%s, gpu_mem=%.2f, max_len=%d, mode=%s) …",
+             checkpoint, quant, gpu_mem, max_len, mode_str)
     _tts = Plapre(
         checkpoint=checkpoint,
         quant=quant,
         gpu_memory_utilization=gpu_mem,
         max_model_len=max_len,
+        use_async=_async_mode,
     )
-    log.info("Model ready.")
+    # Serialize vocoder calls — Vocos cuFFT needs exclusive GPU access to avoid OOM
+    _vocoder_sem = asyncio.Semaphore(1)
+    log.info("Model ready (%s mode).", mode_str)
     yield
     _tts = None
 
@@ -110,35 +118,34 @@ async def speech(req: SpeechRequest):
     silence_samples = int(0.3 * SAMPLE_RATE)
     silence_bytes = struct.pack(f"<{silence_samples}h", *([0] * silence_samples))
 
-    prefetch_count = 2  # sequential first N for low latency
-
     async def generate():
-        async with _lock:
-            # --- Phase 1: Sequential for fast first audio ---
-            seq_limit = min(prefetch_count, len(sentences))
-            for i in range(seq_limit):
-                log.info("Sequential sentence %d/%d: %s", i + 1, len(sentences), sentences[i])
-                audio = await asyncio.to_thread(
-                    _tts._generate_audio, sentences[i], spk, **gen_kwargs,
-                )
-                if audio is not None:
-                    yield _float32_to_pcm16(audio)
-                    if i < len(sentences) - 1:
-                        yield silence_bytes
+        if _async_mode:
+            # Async: all sentences submitted concurrently, vLLM batches internally
+            log.info("Generating %d sentence(s) via AsyncLLM", len(sentences))
+            all_tokens = await _tts.generate_tokens_async(
+                sentences, spk, **gen_kwargs
+            )
+        else:
+            # Sync: batch via vLLM sync engine on thread pool
+            log.info("Generating %d sentence(s) via sync LLM", len(sentences))
+            all_tokens = await asyncio.to_thread(
+                _tts._generate_tokens, sentences, spk, **gen_kwargs
+            )
 
-            # --- Phase 2: Batch remaining via vLLM ---
-            remaining = sentences[seq_limit:]
-            if remaining:
-                log.info("Batch generating %d remaining sentences", len(remaining))
-                results = await asyncio.to_thread(
-                    _tts._generate_audio_batch, remaining, spk, **gen_kwargs,
-                )
-                for j, audio in enumerate(results):
-                    if audio is not None:
-                        yield _float32_to_pcm16(audio)
-                        global_idx = seq_limit + j
-                        if global_idx < len(sentences) - 1:
-                            yield silence_bytes
+        # Vocode sequentially via semaphore — cuFFT needs exclusive GPU access
+        for i, tokens in enumerate(all_tokens):
+            async with _vocoder_sem:
+                try:
+                    audio = await asyncio.to_thread(
+                        _tts._tokens_to_audio, tokens, spk
+                    )
+                except (torch.OutOfMemoryError, RuntimeError) as e:
+                    log.warning("Vocoder failed for sentence %d: %s", i, e)
+                    audio = None
+            if audio is not None:
+                yield _float32_to_pcm16(audio)
+                if i < len(sentences) - 1:
+                    yield silence_bytes
 
     return StreamingResponse(
         generate(),
@@ -179,6 +186,7 @@ def main():
     )
     parser.add_argument("--gpu-mem", type=float, default=0.5, help="GPU memory utilization (default: 0.5)")
     parser.add_argument("--max-model-len", type=int, default=512, help="Max model length (default: 512)")
+    parser.add_argument("--sync", action="store_true", help="Use sync vLLM engine (default: async)")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
     args = parser.parse_args()
@@ -186,6 +194,7 @@ def main():
     os.environ["PLAPRE_CHECKPOINT"] = args.checkpoint
     os.environ["PLAPRE_GPU_MEM"] = str(args.gpu_mem)
     os.environ["PLAPRE_MAX_MODEL_LEN"] = str(args.max_model_len)
+    os.environ["PLAPRE_ASYNC"] = "0" if args.sync else "1"
     uvicorn.run(
         "plapre.server:app",
         host=args.host,
