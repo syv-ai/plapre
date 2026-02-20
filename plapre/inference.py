@@ -75,11 +75,13 @@ class Plapre:
         gpu_memory_utilization: float = 0.4,
         max_model_len: int = 512,
         device: str | None = None,
+        use_async: bool = False,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self._checkpoint = checkpoint
+        self._use_async = use_async
 
         _patch_tokenizer_compat()
 
@@ -104,19 +106,39 @@ class Plapre:
         log.info("Using GGUF model: %s", gguf_path)
 
         # --- vLLM engine ---
-        log.info("Initializing vLLM engine …")
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-        from vllm import LLM
 
-        self._llm = LLM(
-            model=gguf_path,
-            tokenizer=checkpoint,
-            dtype="auto",
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
-            enforce_eager=False,
-            enable_prompt_embeds=True,
-        )
+        if use_async:
+            log.info("Initializing async vLLM engine (AsyncLLM) …")
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.v1.engine.async_llm import AsyncLLM
+
+            engine_args = AsyncEngineArgs(
+                model=gguf_path,
+                tokenizer=checkpoint,
+                dtype="auto",
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_model_len=max_model_len,
+                enforce_eager=False,
+                enable_prompt_embeds=True,
+            )
+            self._async_llm = AsyncLLM.from_engine_args(engine_args)
+            self._llm = None
+            self._request_counter = 0
+        else:
+            log.info("Initializing vLLM engine …")
+            from vllm import LLM
+
+            self._llm = LLM(
+                model=gguf_path,
+                tokenizer=checkpoint,
+                dtype="auto",
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_model_len=max_model_len,
+                enforce_eager=False,
+                enable_prompt_embeds=True,
+            )
+            self._async_llm = None
 
         # --- Speakers (GPU) ---
         self.speakers = self._load_speakers()
@@ -138,7 +160,7 @@ class Plapre:
         # Cache for projected speaker embeddings
         self._proj_cache: dict[bytes, torch.Tensor] = {}
 
-        log.info("Ready – device=%s", self.device)
+        log.info("Ready – device=%s, async=%s", self.device, use_async)
 
     # ------------------------------------------------------------------
     # Public API
@@ -357,6 +379,59 @@ class Plapre:
             texts, speaker_emb, temperature, top_p, top_k, max_tokens
         )
         return [self._tokens_to_audio(t, speaker_emb) for t in all_tokens]
+
+    # ------------------------------------------------------------------
+    # Async generation (for use with AsyncLLM)
+    # ------------------------------------------------------------------
+
+    def _next_request_id(self) -> str:
+        self._request_counter += 1
+        return f"plapre-{self._request_counter}"
+
+    async def _generate_one_async(
+        self,
+        prompt: dict,
+        sampling,
+    ) -> list[int]:
+        """Run a single async generate() call, return token IDs."""
+        request_id = self._next_request_id()
+        final_output = None
+        async for out in self._async_llm.generate(
+            prompt, sampling, request_id=request_id
+        ):
+            final_output = out
+        return list(final_output.outputs[0].token_ids)
+
+    async def generate_tokens_async(
+        self,
+        texts: list[str],
+        speaker_emb: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_tokens: int,
+    ) -> list[list[int]]:
+        """Generate audio token IDs for multiple texts concurrently via AsyncLLM."""
+        import asyncio
+
+        from vllm import SamplingParams
+
+        speaker_hidden = self._project_speaker(speaker_emb)
+
+        prompts = []
+        for text in texts:
+            prompt_ids = self._build_prompt(text)
+            prompts.append(self._build_embeds_prompt(prompt_ids, speaker_hidden))
+
+        sampling = SamplingParams(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+
+        tasks = [self._generate_one_async(p, sampling) for p in prompts]
+        return await asyncio.gather(*tasks)
 
     def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
         import torchaudio
