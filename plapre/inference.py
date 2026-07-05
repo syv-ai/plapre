@@ -65,6 +65,44 @@ def _patch_tokenizer_compat():
     tub.PreTrainedTokenizerBase.__init__ = _patched
 
 
+def _patch_vllm_speculators_gguf():
+    """Let vLLM load GGUF checkpoints under recent versions.
+
+    vLLM's ``maybe_override_with_speculators`` calls ``get_config_dict(model)``,
+    which tries to parse a ``.gguf`` path as a JSON config and raises OSError
+    ("is not a valid JSON file"). A GGUF is never a speculators model, so skip
+    that probe for ``.gguf`` model paths. No-op on vLLM versions without it.
+    """
+    try:
+        import vllm.transformers_utils.config as _cfg
+    except Exception:
+        return
+    orig = getattr(_cfg, "maybe_override_with_speculators", None)
+    if orig is None or getattr(orig, "_plapre_gguf_patched", False):
+        return
+
+    def patched(model, tokenizer, trust_remote_code, revision=None,
+                vllm_speculative_config=None, hf_token=None, **kwargs):
+        if str(model).endswith(".gguf"):
+            return model, tokenizer, vllm_speculative_config
+        return orig(model, tokenizer, trust_remote_code, revision=revision,
+                    vllm_speculative_config=vllm_speculative_config,
+                    hf_token=hf_token, **kwargs)
+
+    patched._plapre_gguf_patched = True
+    # vLLM binds this symbol via `from … import …`, so rebind on every module
+    # that imported the original (plus its home module).
+    import sys as _sys
+
+    _cfg.maybe_override_with_speculators = patched
+    for _m in list(_sys.modules.values()):
+        try:
+            if getattr(_m, "maybe_override_with_speculators", None) is orig:
+                _m.maybe_override_with_speculators = patched
+        except Exception:
+            pass
+
+
 class Plapre:
     """Danish text-to-speech synthesis."""
 
@@ -76,6 +114,7 @@ class Plapre:
         max_model_len: int = 512,
         device: str | None = None,
         use_async: bool = False,
+        enforce_eager: bool = False,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -84,10 +123,18 @@ class Plapre:
         self._use_async = use_async
 
         _patch_tokenizer_compat()
+        _patch_vllm_speculators_gguf()
 
         # --- Tokenizer (CPU) ---
         log.info("Loading tokenizer …")
-        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+        except (ValueError, KeyError, ImportError, OSError):
+            # Some transformers builds can't resolve a custom tokenizer_class
+            # (e.g. `TokenizersBackend`); load the fast tokenizer directly.
+            from transformers import PreTrainedTokenizerFast
+
+            self.tokenizer = PreTrainedTokenizerFast.from_pretrained(checkpoint)
         self.audio_token_start = self.tokenizer.convert_tokens_to_ids("<audio_0>")
         self.audio_token_end = self.tokenizer.convert_tokens_to_ids("<audio_12799>")
         self.text_tag = self.tokenizer.convert_tokens_to_ids("<text>")
@@ -101,9 +148,17 @@ class Plapre:
         log.info("Loading embedding layer …")
         self._embed_tokens = self._load_embed_tokens(checkpoint)
 
-        # --- Resolve GGUF model ---
-        gguf_path = self._resolve_gguf(checkpoint, quant)
-        log.info("Using GGUF model: %s", gguf_path)
+        # --- Resolve model: full safetensors checkpoint, or a GGUF quant ---
+        # `quant="none"` loads the HF checkpoint's full-precision weights directly.
+        # Recent vLLM (0.20+) rejects a bare `.gguf` *file* path in ModelConfig
+        # ("Invalid repository ID or local directory"), so this is the escape hatch
+        # for those versions; GGUF stays the default.
+        if quant in (None, "none", "safetensors"):
+            gguf_path = checkpoint
+            log.info("Using full (safetensors) model: %s", checkpoint)
+        else:
+            gguf_path = self._resolve_gguf(checkpoint, quant)
+            log.info("Using GGUF model: %s", gguf_path)
 
         # --- vLLM engine ---
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -119,7 +174,7 @@ class Plapre:
                 dtype="auto",
                 gpu_memory_utilization=gpu_memory_utilization,
                 max_model_len=max_model_len,
-                enforce_eager=False,
+                enforce_eager=enforce_eager,
                 enable_prompt_embeds=True,
             )
             self._async_llm = AsyncLLM.from_engine_args(engine_args)
@@ -135,7 +190,7 @@ class Plapre:
                 dtype="auto",
                 gpu_memory_utilization=gpu_memory_utilization,
                 max_model_len=max_model_len,
-                enforce_eager=False,
+                enforce_eager=enforce_eager,
                 enable_prompt_embeds=True,
             )
             self._async_llm = None

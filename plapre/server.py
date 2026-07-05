@@ -46,15 +46,18 @@ async def lifespan(app: FastAPI):
     gpu_mem = float(os.environ.get("PLAPRE_GPU_MEM", "0.5"))
     max_len = int(os.environ.get("PLAPRE_MAX_MODEL_LEN", "512"))
     _async_mode = os.environ.get("PLAPRE_ASYNC", "1") == "1"
+    # Disable CUDA graphs (saves VRAM on tight/shared GPUs) with PLAPRE_ENFORCE_EAGER=1.
+    enforce_eager = os.environ.get("PLAPRE_ENFORCE_EAGER", "0") == "1"
     mode_str = "async" if _async_mode else "sync"
-    log.info("Loading model %s (quant=%s, gpu_mem=%.2f, max_len=%d, mode=%s) …",
-             checkpoint, quant, gpu_mem, max_len, mode_str)
+    log.info("Loading model %s (quant=%s, gpu_mem=%.2f, max_len=%d, mode=%s, eager=%s) …",
+             checkpoint, quant, gpu_mem, max_len, mode_str, enforce_eager)
     _tts = Plapre(
         checkpoint=checkpoint,
         quant=quant,
         gpu_memory_utilization=gpu_mem,
         max_model_len=max_len,
         use_async=_async_mode,
+        enforce_eager=enforce_eager,
     )
     # Serialize vocoder calls — Vocos cuFFT needs exclusive GPU access to avoid OOM
     _vocoder_sem = asyncio.Semaphore(1)
