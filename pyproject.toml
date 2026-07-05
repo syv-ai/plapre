@@ -17,6 +17,7 @@ dependencies = [
     "safetensors",
     "soundfile",
     "numpy",
+    "num2words",
     "huggingface-hub",
     "kanade-tokenizer @ git+https://github.com/frothywater/kanade-tokenizer",
 ]
