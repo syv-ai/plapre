@@ -35,6 +35,9 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download, snapshot_download
 from transformers import AutoTokenizer
 
+from plapre import tasks
+from plapre.tasks import TaskTokens
+
 log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
@@ -109,13 +112,16 @@ class Plapre:
     def __init__(
         self,
         checkpoint: str = "syvai/plapre-nano",
-        quant: str = DEFAULT_QUANT,
+        quant: str | None = DEFAULT_QUANT,
         gpu_memory_utilization: float = 0.4,
         max_model_len: int = 512,
         device: str | None = None,
         use_async: bool = False,
         enforce_eager: bool = False,
     ):
+        """Load a plapre checkpoint. Pass ``quant=None`` to load the HF *safetensors* weights
+        directly (needed for checkpoints without a GGUF build, e.g. ``syvai/plapre-nano-p1-3ep``);
+        for the multi-task modes also raise ``max_model_len`` (~1536) to fit reference audio."""
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -140,6 +146,11 @@ class Plapre:
         self.text_tag = self.tokenizer.convert_tokens_to_ids("<text>")
         self.audio_tag = self.tokenizer.convert_tokens_to_ids("<audio>")
         self.eos_id = self.tokenizer.eos_token_id
+
+        # control-token layout for the multi-task modes (clone/context/pace/edit/pronounce);
+        # None-valued on a base checkpoint that lacks these tokens -> mode methods will refuse.
+        self.tasks = TaskTokens.from_tokenizer(self.tokenizer)
+        self.supports_modes = self.tasks.supports_modes
 
         # --- Speaker projection (CPU) ---
         self.speaker_proj = self._load_speaker_proj(checkpoint)
@@ -277,8 +288,287 @@ class Plapre:
         return audio
 
     # ------------------------------------------------------------------
+    # Multi-task modes (require a checkpoint with the control tokens,
+    # e.g. syvai/plapre-nano-p1-3ep loaded with quant=None)
+    # ------------------------------------------------------------------
+
+    def clone(
+        self,
+        text: str,
+        output: str = "clone.wav",
+        *,
+        reference_wav: str | None = None,
+        reference_text: str = "",
+        reference_emb: torch.Tensor | None = None,
+        reference_tokens: list[int] | None = None,
+        durations: list[int] | None = None,
+        pronunciations: list | None = None,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        max_tokens: int = 500,
+    ) -> np.ndarray:
+        """Speak *text* in a reference voice. Give ``reference_wav`` (a clip of the target
+        voice) or ``reference_tokens`` + ``reference_emb``; ``reference_text`` is what that
+        clip says (helps, optional). Optionally layer ``durations`` (pace) and
+        ``pronunciations``."""
+        self._require_modes("clone")
+        ref_tokens, ref_emb = self._resolve_reference(
+            reference_wav, reference_emb, reference_tokens
+        )
+        prompt = tasks.clone_prompt(
+            self.tasks, self._encode(text), self._encode(reference_text),
+            ref_tokens, dur_frames=durations, lex=self._pron_prefix(pronunciations),
+        )
+        return self._synthesize(prompt, ref_emb, output, temperature, top_p, top_k, max_tokens)
+
+    def continue_context(
+        self,
+        text: str,
+        output: str = "context.wav",
+        *,
+        prev_text: str,
+        prev_wav: str | None = None,
+        prev_tokens: list[int] | None = None,
+        same_speaker: bool = True,
+        speaker: str | None = None,
+        speaker_wav: str | None = None,
+        speaker_emb: torch.Tensor | None = None,
+        durations: list[int] | None = None,
+        pronunciations: list | None = None,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        max_tokens: int = 500,
+    ) -> np.ndarray:
+        """Synthesize *text* conditioned on the previous utterance for prosodic continuity.
+        ``prev_text`` is required; add ``prev_wav``/``prev_tokens`` for the previous audio.
+        Keeps the target voice (``speaker``/``speaker_wav``/``speaker_emb``)."""
+        self._require_modes("continue_context")
+        spk = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
+        prev_audio = None
+        if prev_wav is not None:
+            prev_audio, _ = self._encode_audio(prev_wav)
+        elif prev_tokens is not None:
+            prev_audio = list(prev_tokens)
+        prompt = tasks.context_prompt(
+            self.tasks, self._encode(text), self._encode(prev_text), same_speaker,
+            prev_audio_tokens=prev_audio, dur_frames=durations,
+            lex=self._pron_prefix(pronunciations),
+        )
+        return self._synthesize(prompt, spk, output, temperature, top_p, top_k, max_tokens)
+
+    def edit(
+        self,
+        new_text: str,
+        mask_start: int,
+        mask_end: int,
+        output: str = "edit.wav",
+        *,
+        original_wav: str | None = None,
+        original_tokens: list[int] | None = None,
+        speaker: str | None = None,
+        speaker_wav: str | None = None,
+        speaker_emb: torch.Tensor | None = None,
+        pronunciations: list | None = None,
+        min_tokens: int = 0,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        max_tokens: int = 200,
+    ) -> np.ndarray:
+        """Edit an existing clip: regenerate the audio for words ``[mask_start:mask_end)``
+        (Kanade-frame indices, 25 Hz) while giving the model the *full desired* ``new_text``.
+        The fill is spliced back into the original audio. Supply the original clip as
+        ``original_wav`` or ``original_tokens``. For insert/delete, set ``min_tokens`` above/
+        below the masked span so the fill length follows the new text, not the gap."""
+        self._require_modes("edit")
+        emb = None
+        if original_tokens is not None:
+            original_tokens = list(original_tokens)
+        elif original_wav is not None:
+            original_tokens, emb = self._encode_audio(original_wav)
+        else:
+            raise ValueError("edit() needs original_wav or original_tokens")
+        if speaker is not None or speaker_wav is not None or speaker_emb is not None:
+            spk = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
+        elif emb is not None:
+            spk = emb  # keep the edited clip's own voice
+        else:
+            spk = self.speakers[self.default_speaker]
+        prompt = tasks.edit_prompt(
+            self.tasks, self._encode(new_text), original_tokens, mask_start, mask_end,
+            lex=self._pron_prefix(pronunciations),
+        )
+        fill_ids = self._generate_ids(
+            [prompt], spk, temperature, top_p, top_k, max_tokens,
+            stop_token_ids=[self.tasks.edit_end, self.eos_id], min_tokens=min_tokens,
+        )[0]
+        fill = [
+            t - self.audio_token_start
+            for t in fill_ids
+            if self.audio_token_start <= t <= self.audio_token_end
+        ]
+        spliced = original_tokens[:mask_start] + fill + original_tokens[mask_end:]
+        audio = self._decode_tokens(spliced, spk)
+        sf.write(output, audio, SAMPLE_RATE)
+        log.info("Saved %.2fs audio to %s", len(audio) / SAMPLE_RATE, output)
+        return audio
+
+    def speak_paced(
+        self,
+        text: str,
+        durations: list[int],
+        output: str = "paced.wav",
+        *,
+        speaker: str | None = None,
+        speaker_wav: str | None = None,
+        speaker_emb: torch.Tensor | None = None,
+        pronunciations: list | None = None,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        max_tokens: int = 700,
+    ) -> np.ndarray:
+        """Base TTS with explicit per-word length control. ``durations`` = one frame count
+        per word (40 ms each); ``len(durations)`` must equal the number of words in *text*."""
+        self._require_modes("speak_paced")
+        spk = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
+        prompt = tasks.base_prompt(
+            self.tasks, self._encode(text), dur_frames=durations,
+            lex=self._pron_prefix(pronunciations),
+        )
+        return self._synthesize(prompt, spk, output, temperature, top_p, top_k, max_tokens)
+
+    def pronounce(
+        self,
+        text: str,
+        pronunciations: list,
+        output: str = "pronounced.wav",
+        *,
+        speaker: str | None = None,
+        speaker_wav: str | None = None,
+        speaker_emb: torch.Tensor | None = None,
+        durations: list[int] | None = None,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        max_tokens: int = 500,
+    ) -> np.ndarray:
+        """Base TTS with pronunciation references pinned. ``pronunciations`` = a list of
+        ``(word, reference)`` pairs, where ``reference`` is a wav path or a list of Kanade
+        audio tokens rendering that word (ideally from a clean clip that says it)."""
+        self._require_modes("pronounce")
+        spk = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
+        prompt = tasks.base_prompt(
+            self.tasks, self._encode(text), dur_frames=durations,
+            lex=self._pron_prefix(pronunciations),
+        )
+        return self._synthesize(prompt, spk, output, temperature, top_p, top_k, max_tokens)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _require_modes(self, name: str) -> None:
+        if not self.supports_modes:
+            raise RuntimeError(
+                f"{name}() needs a multi-task checkpoint with the control tokens "
+                f"(e.g. Plapre('syvai/plapre-nano-p1-3ep', quant=None)); "
+                f"'{self._checkpoint}' lacks them."
+            )
+
+    def _encode(self, text: str) -> list[int]:
+        return self.tokenizer.encode(self._normalize_text(text), add_special_tokens=False)
+
+    def _pron_prefix(self, pronunciations) -> list[int] | None:
+        """Build the <lex> prefix from [(word, wav_path | token_list), …], or None."""
+        if not pronunciations:
+            return None
+        pairs = []
+        for word, ref in pronunciations:
+            ref_tokens = self._encode_audio(ref)[0] if isinstance(ref, str) else list(ref)
+            pairs.append((self._encode(word), ref_tokens))
+        return tasks.lex_prefix(self.tasks, pairs)
+
+    def _resolve_reference(self, wav, emb, tokens):
+        """-> (kanade audio token list, speaker embedding) for the clone reference."""
+        if tokens is not None:
+            if emb is None:
+                raise ValueError("reference_tokens also needs reference_emb")
+            return list(tokens), emb.to(self.device)
+        if wav is not None:
+            toks, e = self._encode_audio(wav)
+            return toks, e
+        raise ValueError("clone() needs reference_wav or (reference_tokens + reference_emb)")
+
+    @torch.no_grad()
+    def _encode_audio(self, wav_path: str):
+        """Kanade-encode a wav -> (content token indices as list[int], global_embedding)."""
+        import torchaudio
+
+        data, sr = sf.read(wav_path, dtype="float32")
+        data = data[np.newaxis, :] if data.ndim == 1 else data.T
+        wav = torch.from_numpy(data)
+        if sr != SAMPLE_RATE:
+            wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        feats = self.kanade.encode(wav.to(self.device))
+        return feats.content_token_indices.cpu().tolist(), feats.global_embedding
+
+    def _generate_ids(
+        self,
+        prompt_ids_list: list[list[int]],
+        speaker_emb: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_tokens: int,
+        stop_token_ids: list[int] | None = None,
+        min_tokens: int = 0,
+    ) -> list[list[int]]:
+        """Generate token ids from ready-made prompt id lists (the mode builders' output)."""
+        from vllm import SamplingParams
+
+        speaker_hidden = self._project_speaker(speaker_emb)
+        prompts = [self._build_embeds_prompt(ids, speaker_hidden) for ids in prompt_ids_list]
+        sampling = SamplingParams(
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            max_tokens=max_tokens, min_tokens=min_tokens, stop_token_ids=stop_token_ids,
+        )
+        outputs = self._llm.generate(prompts, sampling, use_tqdm=False)
+        return [list(o.outputs[0].token_ids) for o in outputs]
+
+    def _decode_tokens(self, kanade_tokens: list[int], speaker_emb: torch.Tensor) -> np.ndarray:
+        """Decode raw Kanade content-token indices (0..12799) to a waveform."""
+        if not kanade_tokens:
+            return np.array([], dtype=np.float32)
+        tokens_tensor = torch.tensor(kanade_tokens, dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            mel = self.kanade.decode(
+                content_token_indices=tokens_tensor,
+                global_embedding=speaker_emb.float().to(self.device),
+            )
+            from kanade_tokenizer import vocode
+
+            waveform = vocode(self.vocoder, mel.unsqueeze(0))
+        return waveform.squeeze().cpu().numpy()
+
+    def _synthesize(
+        self, prompt_ids, speaker_emb, output, temperature, top_p, top_k, max_tokens
+    ) -> np.ndarray:
+        """Run one mode prompt through generation + Kanade decode and save to *output*."""
+        tokens = self._generate_ids(
+            [prompt_ids], speaker_emb, temperature, top_p, top_k, max_tokens
+        )[0]
+        audio = self._tokens_to_audio(tokens, speaker_emb)
+        if audio is None:
+            log.error("No audio tokens generated. Try different temperature/top_p.")
+            return np.array([], dtype=np.float32)
+        sf.write(output, audio, SAMPLE_RATE)
+        log.info("Saved %.2fs audio to %s", len(audio) / SAMPLE_RATE, output)
+        return audio
 
     @staticmethod
     def _resolve_gguf(checkpoint: str, quant: str) -> str:
@@ -489,21 +779,7 @@ class Plapre:
         return await asyncio.gather(*tasks)
 
     def _extract_speaker_emb(self, wav_path: str) -> torch.Tensor:
-        import torchaudio
-
-        data, sr = sf.read(wav_path, dtype="float32")
-        if data.ndim == 1:
-            data = data[np.newaxis, :]
-        else:
-            data = data.T  # (channels, samples)
-        wav = torch.from_numpy(data)
-        if sr != SAMPLE_RATE:
-            wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-        with torch.no_grad():
-            features = self.kanade.encode(wav.to(self.device))
-        return features.global_embedding
+        return self._encode_audio(wav_path)[1]
 
     def _resolve_speaker(
         self,

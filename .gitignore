@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Generated audio / model artifacts
+*.wav
+*.gguf
+*.safetensors
+
+# Local outputs
+modes_out/
+out/

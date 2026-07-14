@@ -107,6 +107,45 @@ audio = tts.speak("Hej.", output="output.wav")
 print(f"Duration: {len(audio) / 24000:.2f}s")
 ```
 
+## Multi-task inference modes
+
+The multi-task checkpoint [`syvai/plapre-nano-p1-3ep`](https://huggingface.co/syvai/plapre-nano-p1-3ep)
+adds four extra ways to control generation on top of plain TTS: **voice cloning**, **contextual
+prosody**, **pace/duration**, **audio editing**, and **pronunciation references**. Load it with
+`quant=None` (it ships safetensors, no GGUF) and a larger `max_model_len` (reference audio makes
+the prompt longer):
+
+```python
+from plapre import Plapre
+
+tts = Plapre("syvai/plapre-nano-p1-3ep", quant=None, max_model_len=1536)
+
+# 1) Clone a voice — speak text in the voice of a reference clip
+tts.clone("Hej med dig.", output="clone.wav", reference_wav="target_voice.wav")
+
+# 2) Pace / duration — one frame count per word (40 ms each), len == #words
+tts.speak_paced("Det går langsomt.", durations=[18, 14, 30], output="slow.wav")
+
+# 3) Context — condition on the previous line for prosodic continuity
+tts.continue_context("Og så tog han afsted.", prev_text="Han kiggede på uret.",
+                     prev_wav="prev_line.wav", same_speaker=True, output="ctx.wav")
+
+# 4) Edit — regenerate a word span in an existing clip (Kanade-frame indices, 25 Hz)
+tts.edit("Det var en god dag.", mask_start=40, mask_end=55,
+         original_wav="original.wav", min_tokens=12, output="edit.wav")
+
+# 5) Pronunciation — pin how a hard word should sound with reference audio of it
+tts.pronounce("Ifølge Verdenssundhedsorganisationen stiger tallet.",
+              pronunciations=[("Verdenssundhedsorganisationen", "who_word.wav")],
+              output="fixed.wav")
+```
+
+Controls compose: `clone(...)`, `speak_paced(...)`, `continue_context(...)` all accept
+`durations=` and `pronunciations=`, and `edit(...)` accepts `pronunciations=`. Reference audio can
+be a wav path or a list of Kanade tokens. `plapre/tasks.py` holds the exact prompt layout for each
+mode. See `examples/run_modes.py` for an end-to-end script, and the model card for the token
+structures.
+
 ## API Server
 
 Plapre includes a FastAPI server that streams raw PCM audio with chunked transfer encoding, so clients can start playback before the full response is generated.
