@@ -1,4 +1,4 @@
-"""Run every plapre-nano-p1-3ep inference mode end to end and save a wav for each.
+"""Run every plapre-nano-v2 inference mode end to end and save a wav for each.
 
     python examples/run_modes.py --reference target_voice.wav --out out/
 
@@ -15,7 +15,7 @@ from plapre import Plapre
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default="syvai/plapre-nano-p1-3ep")
+    ap.add_argument("--checkpoint", default="syvai/plapre-nano-v2")
     ap.add_argument("--reference", required=True, help="a short Danish wav (voice/context/edit source)")
     ap.add_argument("--out", default="modes_out")
     ap.add_argument("--gpu-memory", type=float, default=0.4)

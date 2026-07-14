@@ -109,7 +109,7 @@ print(f"Duration: {len(audio) / 24000:.2f}s")
 
 ## Multi-task inference modes
 
-The multi-task checkpoint [`syvai/plapre-nano-p1-3ep`](https://huggingface.co/syvai/plapre-nano-p1-3ep)
+The multi-task checkpoint [`syvai/plapre-nano-v2`](https://huggingface.co/syvai/plapre-nano-v2)
 adds four extra ways to control generation on top of plain TTS: **voice cloning**, **contextual
 prosody**, **pace/duration**, **audio editing**, and **pronunciation references**. Load it with
 `quant=None` (it ships safetensors, no GGUF) and a larger `max_model_len` (reference audio makes
@@ -118,7 +118,7 @@ the prompt longer):
 ```python
 from plapre import Plapre
 
-tts = Plapre("syvai/plapre-nano-p1-3ep", quant=None, max_model_len=1536)
+tts = Plapre("syvai/plapre-nano-v2", quant=None, max_model_len=1536)
 
 # 1) Clone a voice — speak text in the voice of a reference clip
 tts.clone("Hej med dig.", output="clone.wav", reference_wav="target_voice.wav")
