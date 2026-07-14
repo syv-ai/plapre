@@ -1,4 +1,4 @@
-"""Prompt construction for the plapre multi-task checkpoints (e.g. ``syvai/plapre-nano-p1-3ep``).
+"""Prompt construction for the plapre multi-task checkpoints (e.g. ``syvai/plapre-nano-v2``).
 
 These models are trained on **2 tasks** — *generate* (text→audio) and *edit* (masked audio
 infill) — plus **4 composable controls** that layer onto generate: *voice-reference/clone*,

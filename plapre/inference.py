@@ -120,7 +120,7 @@ class Plapre:
         enforce_eager: bool = False,
     ):
         """Load a plapre checkpoint. Pass ``quant=None`` to load the HF *safetensors* weights
-        directly (needed for checkpoints without a GGUF build, e.g. ``syvai/plapre-nano-p1-3ep``);
+        directly (needed for checkpoints without a GGUF build, e.g. ``syvai/plapre-nano-v2``);
         for the multi-task modes also raise ``max_model_len`` (~1536) to fit reference audio."""
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -289,7 +289,7 @@ class Plapre:
 
     # ------------------------------------------------------------------
     # Multi-task modes (require a checkpoint with the control tokens,
-    # e.g. syvai/plapre-nano-p1-3ep loaded with quant=None)
+    # e.g. syvai/plapre-nano-v2 loaded with quant=None)
     # ------------------------------------------------------------------
 
     def clone(
@@ -474,7 +474,7 @@ class Plapre:
         if not self.supports_modes:
             raise RuntimeError(
                 f"{name}() needs a multi-task checkpoint with the control tokens "
-                f"(e.g. Plapre('syvai/plapre-nano-p1-3ep', quant=None)); "
+                f"(e.g. Plapre('syvai/plapre-nano-v2', quant=None)); "
                 f"'{self._checkpoint}' lacks them."
             )
 
