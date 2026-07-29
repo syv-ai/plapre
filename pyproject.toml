@@ -13,7 +13,7 @@ dependencies = [
     "torch",
     "torchaudio",
     "transformers",
-    "vllm>=0.15",
+    "vllm>=0.15,<0.16",
     "safetensors",
     "soundfile",
     "numpy",

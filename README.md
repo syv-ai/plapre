@@ -17,6 +17,12 @@ The Plapre models are hosted as **gated models** on Hugging Face. Before using P
 
 ## Installation
 
+> **Important — serving stack**: plapre pins `vllm>=0.15,<0.16`. Newer stacks
+> (measured: vLLM 0.19 / torch 2.10 / transformers 5.13) make the v2/v3 models
+> repeat phrases mid-sentence at dramatically higher rates on identical weights
+> and settings. If you change vLLM/torch/transformers versions, regenerate a
+> multi-sentence text and listen for repetitions before trusting the setup.
+
 Requires Python >= 3.12 and a CUDA GPU.
 
 ```bash
