@@ -28,7 +28,7 @@ uv add git+https://github.com/syv-ai/plapre.git
 | Model | Parameters | HuggingFace | Description |
 |-------|-----------|-------------|-------------|
 | **Plapre Nano v3** (default) | ~335M | [syvai/plapre-nano-v3](https://huggingface.co/syvai/plapre-nano-v3) | Multi-task, sentence-aligned training, trained `</audio>` stop token (fixes v2's end-of-utterance repetition) |
-| Plapre Nano v2 | ~335M | [syvai/plapre-nano-v2](https://huggingface.co/syvai/plapre-nano-v2) | Multi-task (prone to tail loops — prefer v3) |
+| Plapre Nano v2 | ~335M | [syvai/plapre-nano-v2](https://huggingface.co/syvai/plapre-nano-v2) | Alias of v3 since 2026-07-29 (the flawed v2 checkpoint lives in the repo's git history) |
 | Plapre Nano | ~327M | [syvai/plapre-nano](https://huggingface.co/syvai/plapre-nano) | v1 base TTS, GGUF builds available |
 | Plapre Pico | ~118M | [syvai/plapre-pico](https://huggingface.co/syvai/plapre-pico) | Smaller, faster inference |
 
