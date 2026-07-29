@@ -111,7 +111,7 @@ class Plapre:
 
     def __init__(
         self,
-        checkpoint: str = "syvai/plapre-nano-v3",
+        checkpoint: str = "syvai/plapre-nano-v2",
         quant: str | None = None,
         gpu_memory_utilization: float = 0.4,
         max_model_len: int = 1024,
@@ -120,10 +120,10 @@ class Plapre:
         enforce_eager: bool = False,
         dtype: str = "float32",
     ):
-        """Load a plapre checkpoint (default: ``syvai/plapre-nano-v3`` safetensors).
+        """Load a plapre checkpoint (default: ``syvai/plapre-nano-v2`` safetensors).
 
-        ``quant``: ``None`` (default) loads the HF *safetensors* weights directly — v2/v3
-        ship no GGUF. Pass e.g. ``"q8_0"`` for the v1 ``syvai/plapre-nano`` GGUF builds.
+        ``quant``: ``None`` (default) loads the HF *safetensors* weights directly — v2
+        ships no GGUF. Pass e.g. ``"q8_0"`` for the v1 ``syvai/plapre-nano`` GGUF builds.
         ``dtype``: ``"float32"`` by default — plapre trains fp32 master weights, and lower
         serving precision measurably increases end-of-utterance looping. For the multi-task
         modes with long reference audio raise ``max_model_len`` (~1536)."""
@@ -156,8 +156,8 @@ class Plapre:
         # None-valued on a base checkpoint that lacks these tokens -> mode methods will refuse.
         self.tasks = TaskTokens.from_tokenizer(self.tokenizer)
         self.supports_modes = self.tasks.supports_modes
-        # v3 ends generated audio with a trained `</audio>` before `<eos>`; stop on both.
-        # On v1/v2 vocabs this is just [eos].
+        # Multi-task checkpoints end generated audio with a trained `</audio>` before
+        # `<eos>`; stop on both. On vocabs without `</audio>` this is just [eos].
         self.gen_stop_ids = self.tasks.stop_ids
 
         # --- Speaker projection (CPU) ---
@@ -168,7 +168,7 @@ class Plapre:
         self._embed_tokens = self._load_embed_tokens(checkpoint)
 
         # --- Resolve model: full safetensors checkpoint (default), or a v1 GGUF quant ---
-        # v2/v3 ship safetensors only. GGUF (v1) also needs the speculators patch on
+        # v2 ships safetensors only. GGUF (v1) also needs the speculators patch on
         # recent vLLM, which rejects a bare `.gguf` file path in ModelConfig.
         if quant in (None, "none", "safetensors"):
             gguf_path = checkpoint

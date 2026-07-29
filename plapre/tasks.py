@@ -12,9 +12,9 @@ harness (``train_p1_ablate.py`` ``P1MultiTask``); the sequence order is::
 
     [SPK]  [lex]  [voice-ref]  [context]   <text> BPE  [<dur>…</dur>]  <audio> …audio…  <eos>
 
-v3 checkpoints (``syvai/plapre-nano-v3``) additionally end generated audio with a trained
-``</audio>`` terminator before ``<eos>`` — generation must stop on BOTH (:attr:`TaskTokens.
-stop_ids`); the token is absent (``None``) on v1/v2 vocabs.
+Current multi-task checkpoints end generated audio with a trained ``</audio>`` terminator
+before ``<eos>`` — generation must stop on BOTH (:attr:`TaskTokens.stop_ids`); the token is
+absent (``None``) on older vocabs.
 
 The speaker embedding is prepended by the engine (not a token), so these builders return the
 token-id list that follows it.
@@ -35,7 +35,7 @@ LEX_TOTAL_AUDIO_CAP = 200  # audio tokens across all pronunciation references
 
 _CONTROL_TOKENS = {
     "text": "<text>", "audio": "<audio>",
-    "audio_end": "</audio>",   # v3 trained audio terminator (None on v1/v2)
+    "audio_end": "</audio>",   # trained audio terminator (None on older vocabs)
     "audio_base": "<audio_0>", "dur_base": "<dur_0>",
     "dur": "<dur>", "dur_end": "</dur>",
     "ref_text": "<ref_text>", "ref_text_end": "</ref_text>",
@@ -80,10 +80,8 @@ class TaskTokens:
 
     @property
     def stop_ids(self) -> list[int]:
-        """Generation stop tokens: ``<eos>``, plus the trained ``</audio>`` terminator on
-        v3 checkpoints. v2's single once-per-sequence ``<eos>`` proved too weak a stop
-        signal (the model re-spoke its final phrase in up to ~28 % of sampled
-        generations); v3 trains both terminators and must stop on both."""
+        """Generation stop tokens: ``<eos>``, plus the trained ``</audio>`` terminator when
+        the vocab has one. Stopping on both is required for correct termination."""
         stops = [self.eos]
         if self.ids.get("audio_end") is not None:
             stops.append(self.ids["audio_end"])

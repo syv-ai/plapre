@@ -41,7 +41,7 @@ _async_mode: bool = False
 async def lifespan(app: FastAPI):
     global _tts, _vocoder_sem, _async_mode
 
-    checkpoint = os.environ.get("PLAPRE_CHECKPOINT", "syvai/plapre-nano-v3")
+    checkpoint = os.environ.get("PLAPRE_CHECKPOINT", "syvai/plapre-nano-v2")
     quant = os.environ.get("PLAPRE_QUANT", "none")
     gpu_mem = float(os.environ.get("PLAPRE_GPU_MEM", "0.5"))
     max_len = int(os.environ.get("PLAPRE_MAX_MODEL_LEN", "512"))
@@ -184,8 +184,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="Plapre TTS server")
     parser.add_argument(
-        "--checkpoint", default="syvai/plapre-nano-v3",
-        help="HuggingFace checkpoint (default: syvai/plapre-nano-v3)",
+        "--checkpoint", default="syvai/plapre-nano-v2",
+        help="HuggingFace checkpoint (default: syvai/plapre-nano-v2)",
     )
     parser.add_argument("--gpu-mem", type=float, default=0.5, help="GPU memory utilization (default: 0.5)")
     parser.add_argument("--max-model-len", type=int, default=512, help="Max model length (default: 512)")
