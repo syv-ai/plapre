@@ -95,6 +95,31 @@ def test_lex_total_audio_budget():
     assert sum(1 for x in big if 1000 <= x < 2000) == tasks.LEX_TOTAL_AUDIO_CAP
 
 
+def test_stop_ids_v3_dual_terminator():
+    T, v = _tokens()  # fake vocab includes </audio> (all _CONTROL_TOKENS present)
+    assert T.audio_end == v["</audio>"]
+    assert T.stop_ids == [9, v["</audio>"]]
+
+
+def test_stop_ids_v2_vocab_without_audio_end():
+    vocab = {tok: 100 + i for i, tok in enumerate(tasks._CONTROL_TOKENS.values())
+             if tok != "</audio>"}
+    vocab["<audio_0>"] = 1000
+    vocab["<dur_0>"] = 2000
+
+    class _Tok:
+        def get_vocab(self):
+            return vocab
+
+        eos_token_id = 9
+
+    T = TaskTokens.from_tokenizer(_Tok())
+    assert T.audio_end is None
+    assert T.stop_ids == [9]
+    assert T.supports_modes  # </audio> is not a mode marker
+
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -27,7 +27,9 @@ uv add git+https://github.com/syv-ai/plapre.git
 
 | Model | Parameters | HuggingFace | Description |
 |-------|-----------|-------------|-------------|
-| Plapre Nano | ~327M | [syvai/plapre-nano](https://huggingface.co/syvai/plapre-nano) | Larger, higher quality |
+| **Plapre Nano v3** (default) | ~335M | [syvai/plapre-nano-v3](https://huggingface.co/syvai/plapre-nano-v3) | Multi-task, sentence-aligned training, trained `</audio>` stop token (fixes v2's end-of-utterance repetition) |
+| Plapre Nano v2 | ~335M | [syvai/plapre-nano-v2](https://huggingface.co/syvai/plapre-nano-v2) | Multi-task (prone to tail loops — prefer v3) |
+| Plapre Nano | ~327M | [syvai/plapre-nano](https://huggingface.co/syvai/plapre-nano) | v1 base TTS, GGUF builds available |
 | Plapre Pico | ~118M | [syvai/plapre-pico](https://huggingface.co/syvai/plapre-pico) | Smaller, faster inference |
 
 ## Usage
@@ -37,16 +39,24 @@ uv add git+https://github.com/syv-ai/plapre.git
 ```python
 from plapre import Plapre
 
-tts = Plapre("syvai/plapre-nano")
+tts = Plapre()  # syvai/plapre-nano-v3, fp32 safetensors
 tts.speak("Hej, hvordan har du det?", output="output.wav")
+
+# v1 GGUF builds still work:
+# tts = Plapre("syvai/plapre-nano", quant="q8_0", max_model_len=512)
 ```
+
+v3 notes (handled automatically by the library): generation stops on both the trained
+`</audio>` terminator and `<eos>`; target text gets terminal punctuation appended when
+missing (the stop signal is strongest on sentence-final text); weights load in fp32 —
+lower serving precision measurably increases end-of-utterance repetition.
 
 ### GPU memory
 
 ```python
 # Adjust GPU memory allocated to vLLM (default: 0.4)
 # Leave headroom for the Kanade vocoder (~400 MiB)
-tts = Plapre("syvai/plapre-nano", gpu_memory_utilization=0.5)
+tts = Plapre(gpu_memory_utilization=0.5)
 ```
 
 ### Choose a speaker
@@ -109,16 +119,15 @@ print(f"Duration: {len(audio) / 24000:.2f}s")
 
 ## Multi-task inference modes
 
-The multi-task checkpoint [`syvai/plapre-nano-v2`](https://huggingface.co/syvai/plapre-nano-v2)
-adds four extra ways to control generation on top of plain TTS: **voice cloning**, **contextual
-prosody**, **pace/duration**, **audio editing**, and **pronunciation references**. Load it with
-`quant=None` (it ships safetensors, no GGUF) and a larger `max_model_len` (reference audio makes
-the prompt longer):
+The multi-task checkpoints ([`syvai/plapre-nano-v3`](https://huggingface.co/syvai/plapre-nano-v3),
+default) add four extra ways to control generation on top of plain TTS: **voice cloning**,
+**contextual prosody**, **pace/duration**, **audio editing**, and **pronunciation references**.
+For long reference audio raise `max_model_len`:
 
 ```python
 from plapre import Plapre
 
-tts = Plapre("syvai/plapre-nano-v2", quant=None, max_model_len=1536)
+tts = Plapre(max_model_len=1536)
 
 # 1) Clone a voice — speak text in the voice of a reference clip
 tts.clone("Hej med dig.", output="clone.wav", reference_wav="target_voice.wav")
@@ -162,7 +171,7 @@ uv add "plapre[serve] @ git+https://github.com/syv-ai/plapre.git"
 plapre-serve --port 8000
 
 # Or with a specific checkpoint and GPU memory settings
-plapre-serve --checkpoint syvai/plapre-nano --gpu-mem 0.5 --port 8000
+plapre-serve --checkpoint syvai/plapre-nano-v3 --gpu-mem 0.5 --port 8000
 ```
 
 Configuration via environment variables is also supported: `PLAPRE_CHECKPOINT`, `PLAPRE_GPU_MEM`, `PLAPRE_MAX_MODEL_LEN`.

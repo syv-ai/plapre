@@ -111,17 +111,22 @@ class Plapre:
 
     def __init__(
         self,
-        checkpoint: str = "syvai/plapre-nano",
-        quant: str | None = DEFAULT_QUANT,
+        checkpoint: str = "syvai/plapre-nano-v3",
+        quant: str | None = None,
         gpu_memory_utilization: float = 0.4,
-        max_model_len: int = 512,
+        max_model_len: int = 1024,
         device: str | None = None,
         use_async: bool = False,
         enforce_eager: bool = False,
+        dtype: str = "float32",
     ):
-        """Load a plapre checkpoint. Pass ``quant=None`` to load the HF *safetensors* weights
-        directly (needed for checkpoints without a GGUF build, e.g. ``syvai/plapre-nano-v2``);
-        for the multi-task modes also raise ``max_model_len`` (~1536) to fit reference audio."""
+        """Load a plapre checkpoint (default: ``syvai/plapre-nano-v3`` safetensors).
+
+        ``quant``: ``None`` (default) loads the HF *safetensors* weights directly — v2/v3
+        ship no GGUF. Pass e.g. ``"q8_0"`` for the v1 ``syvai/plapre-nano`` GGUF builds.
+        ``dtype``: ``"float32"`` by default — plapre trains fp32 master weights, and lower
+        serving precision measurably increases end-of-utterance looping. For the multi-task
+        modes with long reference audio raise ``max_model_len`` (~1536)."""
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -151,6 +156,9 @@ class Plapre:
         # None-valued on a base checkpoint that lacks these tokens -> mode methods will refuse.
         self.tasks = TaskTokens.from_tokenizer(self.tokenizer)
         self.supports_modes = self.tasks.supports_modes
+        # v3 ends generated audio with a trained `</audio>` before `<eos>`; stop on both.
+        # On v1/v2 vocabs this is just [eos].
+        self.gen_stop_ids = self.tasks.stop_ids
 
         # --- Speaker projection (CPU) ---
         self.speaker_proj = self._load_speaker_proj(checkpoint)
@@ -159,11 +167,9 @@ class Plapre:
         log.info("Loading embedding layer …")
         self._embed_tokens = self._load_embed_tokens(checkpoint)
 
-        # --- Resolve model: full safetensors checkpoint, or a GGUF quant ---
-        # `quant="none"` loads the HF checkpoint's full-precision weights directly.
-        # Recent vLLM (0.20+) rejects a bare `.gguf` *file* path in ModelConfig
-        # ("Invalid repository ID or local directory"), so this is the escape hatch
-        # for those versions; GGUF stays the default.
+        # --- Resolve model: full safetensors checkpoint (default), or a v1 GGUF quant ---
+        # v2/v3 ship safetensors only. GGUF (v1) also needs the speculators patch on
+        # recent vLLM, which rejects a bare `.gguf` file path in ModelConfig.
         if quant in (None, "none", "safetensors"):
             gguf_path = checkpoint
             log.info("Using full (safetensors) model: %s", checkpoint)
@@ -182,7 +188,7 @@ class Plapre:
             engine_args = AsyncEngineArgs(
                 model=gguf_path,
                 tokenizer=checkpoint,
-                dtype="auto",
+                dtype=dtype,
                 gpu_memory_utilization=gpu_memory_utilization,
                 max_model_len=max_model_len,
                 enforce_eager=enforce_eager,
@@ -198,7 +204,7 @@ class Plapre:
             self._llm = LLM(
                 model=gguf_path,
                 tokenizer=checkpoint,
-                dtype="auto",
+                dtype=dtype,
                 gpu_memory_utilization=gpu_memory_utilization,
                 max_model_len=max_model_len,
                 enforce_eager=enforce_eager,
@@ -317,7 +323,7 @@ class Plapre:
             reference_wav, reference_emb, reference_tokens
         )
         prompt = tasks.clone_prompt(
-            self.tasks, self._encode(text), self._encode(reference_text),
+            self.tasks, self._encode_target(text), self._encode(reference_text),
             ref_tokens, dur_frames=durations, lex=self._pron_prefix(pronunciations),
         )
         return self._synthesize(prompt, ref_emb, output, temperature, top_p, top_k, max_tokens)
@@ -352,7 +358,7 @@ class Plapre:
         elif prev_tokens is not None:
             prev_audio = list(prev_tokens)
         prompt = tasks.context_prompt(
-            self.tasks, self._encode(text), self._encode(prev_text), same_speaker,
+            self.tasks, self._encode_target(text), self._encode(prev_text), same_speaker,
             prev_audio_tokens=prev_audio, dur_frames=durations,
             lex=self._pron_prefix(pronunciations),
         )
@@ -435,7 +441,7 @@ class Plapre:
         self._require_modes("speak_paced")
         spk = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
         prompt = tasks.base_prompt(
-            self.tasks, self._encode(text), dur_frames=durations,
+            self.tasks, self._encode_target(text), dur_frames=durations,
             lex=self._pron_prefix(pronunciations),
         )
         return self._synthesize(prompt, spk, output, temperature, top_p, top_k, max_tokens)
@@ -461,7 +467,7 @@ class Plapre:
         self._require_modes("pronounce")
         spk = self._resolve_speaker(speaker, speaker_wav, speaker_emb)
         prompt = tasks.base_prompt(
-            self.tasks, self._encode(text), dur_frames=durations,
+            self.tasks, self._encode_target(text), dur_frames=durations,
             lex=self._pron_prefix(pronunciations),
         )
         return self._synthesize(prompt, spk, output, temperature, top_p, top_k, max_tokens)
@@ -480,6 +486,28 @@ class Plapre:
 
     def _encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(self._normalize_text(text), add_special_tokens=False)
+
+    _SENT_END = (".", "?", "!", ":", "…")
+
+    @classmethod
+    def _ensure_terminal_punct(cls, text: str) -> str:
+        """Append a period when the target text ends mid-sentence (e.g. on a comma).
+        The model's stop signal is strongest on sentence-final text — measured loop
+        rate on comma-ending fragments drops ~7x with this normalization. Never
+        changes the word count (punctuation attaches to the final word)."""
+        t = text.rstrip()
+        if not t:
+            return t
+        if t.endswith(","):
+            t = t[:-1]
+        return t if t.endswith(cls._SENT_END) else t + "."
+
+    def _encode_target(self, text: str) -> list[int]:
+        """Encode a TARGET text (the words being synthesized): normalization plus
+        terminal punctuation. Reference/context transcripts keep `_encode` verbatim."""
+        return self.tokenizer.encode(
+            self._ensure_terminal_punct(self._normalize_text(text)), add_special_tokens=False
+        )
 
     def _pron_prefix(self, pronunciations) -> list[int] | None:
         """Build the <lex> prefix from [(word, wav_path | token_list), …], or None."""
@@ -533,6 +561,8 @@ class Plapre:
 
         speaker_hidden = self._project_speaker(speaker_emb)
         prompts = [self._build_embeds_prompt(ids, speaker_hidden) for ids in prompt_ids_list]
+        if stop_token_ids is None:
+            stop_token_ids = self.gen_stop_ids
         sampling = SamplingParams(
             temperature=temperature, top_k=top_k, top_p=top_p,
             max_tokens=max_tokens, min_tokens=min_tokens, stop_token_ids=stop_token_ids,
@@ -627,7 +657,7 @@ class Plapre:
         return hidden
 
     def _build_prompt(self, text: str) -> list[int]:
-        text_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        text_ids = self.tokenizer.encode(self._ensure_terminal_punct(text), add_special_tokens=False)
         return [self.text_tag] + text_ids + [self.audio_tag]
 
     @torch.no_grad()
@@ -666,6 +696,7 @@ class Plapre:
             top_k=top_k,
             top_p=top_p,
             max_tokens=max_tokens,
+            stop_token_ids=self.gen_stop_ids,
         )
 
         outputs = self._llm.generate(prompts, sampling, use_tqdm=False)
@@ -773,6 +804,7 @@ class Plapre:
             top_k=top_k,
             top_p=top_p,
             max_tokens=max_tokens,
+            stop_token_ids=self.gen_stop_ids,
         )
 
         tasks = [self._generate_one_async(p, sampling) for p in prompts]
